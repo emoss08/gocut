@@ -40,6 +40,14 @@ For each `compile` invocation, gocut:
    and column positions and linker symbol indices. A name that was removed counts as changed.
 5. If every used name hashes the same, it reuses the old archive and patches it.
 
+A changed dependency whose new export data gocut itself produced, by a patch that only moved
+positions or symbol indices in copied objects, skips step 4 and the identity and import-graph checks: gocut
+links the new fingerprint to the old one (`.same`), so every name hashes the same by
+construction. This matters because a patched package's export data changes whenever it carries
+copies of moved objects, and without the link each of its importers would re-hash every name it
+uses. The link is written only after the new export data is re-parsed and every replaced element
+masks to the same bytes, and only when the output used is the patched archive.
+
 Patching rewrites:
 
 - the build ID;
@@ -129,6 +137,7 @@ package it compiles, so reuse can start on the next build.
 | `GOCUT_MAX_BYTES` | `4294967296` (4 GiB) | Store budget. |
 | `GOCUT_RECORDS` | `4` | Records kept per compile key. |
 | `GOCUT_DEBUG_KEY` | unset | When set, writes the bytes behind each compile key to `$GOCUT_DIR/keys/`. |
+| `GOCUT_DETACH` | on | Once a compile's output is in place, gocut forks and returns, and a detached child saves the record (compressed archive, export data, record JSON). Everything the record reads from the sources and dependency archives is read before the fork. `0` saves inline. |
 
 The compile key includes every environment variable starting with `GO` except `GOFLAGS` and
 gocut's own `GOCUT_*` settings, so changing a gocut setting keeps existing records usable.
@@ -137,16 +146,60 @@ gocut's own `GOCUT_*` settings, so changing a gocut setting keeps existing recor
 
 | Command | What it does |
 |---|---|
-| `gocut stats [seconds]` | Summarise the event log, optionally only the last N seconds: decisions, shadow matches and mismatches, compile time a verified reuse would have skipped, top reasons for no reuse, gocut's own overhead. |
+| `gocut stats [seconds]` | Summarise the event log, optionally only the last N seconds: decisions, shadow matches and mismatches, compile time a verified reuse would have skipped, top reasons for no reuse, gocut's own overhead, and gocut's time per reused package (median, p90, mean) with a per-phase breakdown from each event's `phases`. |
 | `gocut clear-log` | Delete the event log. |
 | `gocut gc` | Run eviction now and print the store size before and after. |
 | `gocut dumphash <archive> <pkgpath>` | Debugging: recompute the content hashes of an archive's hashed symbols and report any that differ from the stored ones. |
 
 ## Measured so far
 
-All numbers are from one 14-core WSL2 machine with Go 1.27.1, building Trenova's `cmd/api` with
-`-gcflags=<module>/...=-N -l -ldflags=-s -w` (the hot-reload flags), using
-`scripts/tms-run.sh`.
+### Trenova on keel v0.5.0, `-dwarf=false` watch flags
+
+One 4-core Linux VM (16 GB RAM) with Go 1.27.1, building Trenova's `cmd/api` from the keel v0.5.0
+tree with its watch flags: `-gcflags=all=-dwarf=false`,
+`-gcflags=<module>/...=-N -l -dwarf=false`, `-ldflags=-s -w`, `-trimpath`, `-p 3`. That is
+`NODWARF=1 scripts/tms-run.sh`. Times are medians of three runs. Each edit build recompiles 1042
+packages without gocut.
+
+| Edit | Without gocut | With gocut active |
+|---|---|---|
+| Cold build | 259 s | 269 s (shadow) |
+| `s4-end`: exported function appended to a domain file | 82.4 s | 30.3 s |
+| `s4-mid`: function inserted mid-file, shifting every later line | 81.7 s | 31.2 s |
+| `s2-body`: line added inside an unexported function | 80.2 s | 29.2 s |
+
+Reverting an edit takes about 8 s either way, because cmd/go serves it from its own cache.
+
+Shadow mode, all three edits: gocut reused 1041 of the 1042 recompiled packages (the remaining one
+is the edited package itself), and all 1041 were byte-identical to the compiler's output. No
+package was blocked by a guard. In active mode with `GOCUT_VERIFY=10`, 9 to 13 percent of reuses
+were verified (95 to 133 per edit build, 971 across the nine timed edit builds), and every one
+matched.
+The only packages not reused in active mode were a few `evicted` ones (5 to 14 in two of nine
+edit builds), because `tms-run.sh` caps the store at 3 GiB.
+
+gocut's own time per reused package, in active mode, same edits:
+
+| | Median | p90 | Mean |
+|---|---|---|---|
+| Before the overhead work | 30 to 36 ms | 80 to 108 ms | 50 to 74 ms |
+| Now | 19 to 21 ms | 55 to 59 ms | 30 to 34 ms |
+
+With that binary, before the overhead work, the active edit builds took 45.6 s, 38.9 s and
+33.7 s (one run each). The largest gains came from linking position-only patched export data
+to its source (late packages such as GraphQL resolvers had up to 95 changed dependencies, each
+re-hashed by every importer) and from saving records in a detached child. What remains is
+spread out: reading and parsing the dependencies' old export data, walking copied objects,
+reading the old archive and writing the output.
+
+The toy matrix (`scripts/toy-matrix.sh`, 18 scenarios in 3 flag modes: default, `-N -l` and
+`-N -l -dwarf=false`) has 0 mismatches in shadow, active and record mode.
+
+### Earlier tree (before the keel v0.5.0 move), full DWARF
+
+These numbers are from before the keel fix and the switch to `-dwarf=false` watch flags. They
+were measured on one 14-core WSL2 machine with Go 1.27.1, building Trenova's `cmd/api` with
+`-gcflags=<module>/...=-N -l -ldflags=-s -w`.
 
 Baseline, without gocut:
 
@@ -161,9 +214,7 @@ Shadow mode, appended-function edit: gocut decided to reuse 796 of the 797 recom
 795 of those were byte-identical to the compiler's output. The one mismatch was
 compiler-generated wrapper debug info carrying moved line numbers. That case is now guarded.
 
-The toy matrix (`scripts/toy-matrix.sh`, 18 scenarios in 2 flag modes) has 0 mismatches.
-
-### Active-mode timings
+#### Active-mode timings
 
 Same machine, flags and edits, each the first edit after a cold build, `GOCUT_VERIFY=10`:
 
@@ -174,8 +225,9 @@ Same machine, flags and edits, each the first edit after a cold build, `GOCUT_VE
 | Line added inside an unexported function | 145 s | 87 s |
 
 Every sampled reuse (340 across the three edits) was byte-identical to the compiler's output.
-The remaining time is mostly the compiles gocut must still run (the verified sample and the
-packages blocked by the wrapper guard), the link, and gocut's own decide-and-patch work.
+The remaining time was mostly the compiles gocut must still run (the verified sample and the
+packages blocked by the wrapper guard), the link, and gocut's own decide-and-patch work, then a
+median of about 170 to 240 ms per reused package.
 
 ## Limits
 
@@ -183,9 +235,14 @@ packages blocked by the wrapper guard), the link, and gocut's own decide-and-pat
   markers is rejected, and wasm export data is not supported.
 - Only amd64 has been tested.
 - Positions inside generic or inlinable function bodies are not masked. If a function a package
-  uses has a body in export data and that body's lines move, the package is recompiled.
-- The wrapper guard is conservative. It blocks any package that calls a method of a moved type,
-  whether or not that call would produce a wrapper.
+  uses has a body in export data and that body's lines move, the package is recompiled. Masking
+  them alone would be wrong: a package that inlines or instantiates the body compiles it into
+  its own object code, line table included, and gocut does not patch line tables. With the
+  `-N -l` watch flags, first-party packages export no inline bodies, so only generic bodies are
+  affected.
+- The wrapper guard applies only with full DWARF (without `-dwarf=false`). It is conservative:
+  it blocks any package that calls a method of a moved type, whether or not that call would
+  produce a wrapper.
 - Usage is found by a lexical scan for `name.Selector`. It cannot see uses through dot imports,
   so those are blocked. It can over-count, for example when a local variable shadows an import
   name, which only reduces reuse.
@@ -200,7 +257,7 @@ The store lives in `GOCUT_DIR`:
 |---|---|
 | `rec/` | One JSON file per compile key, holding up to `GOCUT_RECORDS` records. |
 | `out/` | Compiled archives, zstd-compressed, by content hash. |
-| `ex/` | Per dependency fingerprint: its export data (`.bits.zst`), cached name hashes (`.hash`, one `name<TAB>hash` line per entry, appended) and its linker symbol table (`.lsym`). |
+| `ex/` | Per dependency fingerprint: its export data (`.bits.zst`), cached name hashes (`.hash`, one `name<TAB>hash` line per entry, appended), its linker symbol table (`.lsym`), its package name, init flag and import-graph hash (`.pkg`), and, for export data gocut produced by a position-only patch, the fingerprint it hashes like (`.same`; hashes and package facts are then kept under that fingerprint). |
 | `mismatch/` | Saved mismatch pairs. |
 | `gc.total`, `gc.added` | Size of the store at the last eviction walk, and bytes written since. |
 | `events.jsonl` | Event log, one line per compile. |
@@ -252,9 +309,12 @@ scripts/toy-matrix.sh add-init field-pused
 ```
 
 Environment: `GOCUT` (binary, default `target/release/gocut`), `GOCUT_MODE` (`shadow`, `active`
-or `record`), `MODES` (`default`, `nl` for `-gcflags=ex/...=-N -l`, or both), `TOY_GO_P` (pass
-`-p N` to `go build`), `KEEP=1` (keep the work directory). It needs `go` and `python3`. The work
-directory is kept on failure.
+or `record`), `MODES` (any of `default`, `nl` for `-gcflags=ex/...=-N -l`, `nld` for
+`-gcflags=ex/...=-N -l -dwarf=false`; default `default nl`), `TOY_GO_P` (pass
+`-p N` to `go build`), `KEEP=1` (keep the work directory). It needs `go` and `python3`, and runs
+the `go` first on `PATH` with `GOTOOLCHAIN=local`, so put the Go version you want to test first on
+`PATH`. The work directory is kept on failure. In active mode a verified sample row
+(`reuse+verify`) counts as a reuse only if it matched.
 
 ### Trenova runs
 
@@ -277,6 +337,8 @@ a file with uncommitted changes and restores every edited file on exit.
 It uses separate Go caches for baseline (`~/.cache/go-build-gocut-base`) and gocut runs
 (`~/.cache/go-build-gocut`), and `~/.cache/gocut-tms` as the gocut store. It stops if those
 caches pass `LIMIT_GB` (default 18) and sets `GOCUT_MAX_BYTES` to 3 GiB unless you set it.
+`NODWARF=1` adds `-dwarf=false` to the compiler flags, matching Trenova's watch builds (the link
+already strips DWARF with `-w`).
 `TMS` and `GOCUT` override the Trenova and gocut paths.
 
 ## License
