@@ -519,7 +519,8 @@ spec_matches() {
 			if [[ $present == 0 ]]; then return 0; fi
 			;;
 		reuse)
-			if [[ $present == 1 && $d == reuse && ($s == match || $GOCUT_MODE == active) ]]; then
+			if [[ $present == 1 && ($d == reuse && ($s == match || $GOCUT_MODE == active) ||
+				$d == reuse+verify && $s == match) ]]; then
 				return 0
 			fi
 			;;
@@ -570,7 +571,7 @@ eval_row() {
 	n_rows=$((n_rows + 1))
 	if [[ $present == 1 ]]; then
 		n_compiled=$((n_compiled + 1))
-		if [[ $d == reuse ]]; then n_reuse=$((n_reuse + 1)); fi
+		if [[ $d == reuse* ]]; then n_reuse=$((n_reuse + 1)); fi
 		if [[ $s == match ]]; then n_match=$((n_match + 1)); fi
 		if [[ $s == mismatch* ]]; then
 			n_mismatch=$((n_mismatch + 1))
