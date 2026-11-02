@@ -88,6 +88,28 @@ pub struct Event {
     pub gc_ms: f64,
     pub kind: String,
     pub tried: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub phases: BTreeMap<String, f64>,
+}
+
+thread_local! {
+    static PHASES: std::cell::RefCell<BTreeMap<String, f64>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// Runs `f`, adding its wall time in milliseconds to phase `name` of the current event.
+pub fn timed<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    let t = std::time::Instant::now();
+    let r = f();
+    add_phase(name, t.elapsed().as_secs_f64() * 1000.0);
+    r
+}
+
+pub fn add_phase(name: &str, ms: f64) {
+    PHASES.with(|p| *p.borrow_mut().entry(name.to_string()).or_default() += ms);
+}
+
+pub fn take_phases() -> BTreeMap<String, f64> {
+    PHASES.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
 impl Event {
@@ -369,6 +391,35 @@ impl Store {
         Ok(())
     }
 
+    // <fp>.same names the fingerprint whose export data hashes exactly like <fp>'s (positions and
+    // symbol indices aside). Name hashes and package facts are then kept under that fingerprint.
+    pub fn canonical(&self, fp: &str) -> String {
+        match std::fs::read_to_string(self.shard("ex", fp, "same")) {
+            Ok(c) if c.len() == fp.len() && c.bytes().all(|b| b.is_ascii_hexdigit()) => c,
+            _ => fp.to_string(),
+        }
+    }
+
+    pub fn link_same(&self, fp: &str, canonical: &str) -> Result<()> {
+        if fp != canonical {
+            self.write_once(&self.shard("ex", fp, "same"), || Ok(canonical.as_bytes().to_vec()))?;
+        }
+        Ok(())
+    }
+
+    // <fp>.pkg: "name\tinit\tpkghash", the facts the identity and import-graph checks compare.
+    pub fn read_pkg_facts(&self, fp: &str) -> Option<(String, bool, String)> {
+        let s = std::fs::read_to_string(self.shard("ex", fp, "pkg")).ok()?;
+        let mut it = s.split('\t');
+        let (n, i, h) = (it.next()?, it.next()?, it.next()?);
+        (h.len() == 64 && it.next().is_none()).then(|| (n.to_string(), i == "1", h.to_string()))
+    }
+
+    pub fn write_pkg_facts(&self, fp: &str, f: &(String, bool, String)) -> Result<()> {
+        let s = format!("{}\t{}\t{}", f.0, if f.1 { "1" } else { "0" }, f.2);
+        self.write_once(&self.shard("ex", fp, "pkg"), || Ok(s.into_bytes()))
+    }
+
     pub fn read_lsyms(&self, fp: &str) -> Option<LsymTable> {
         decode_lsyms(&std::fs::read(self.shard("ex", fp, "lsym")).ok()?)
     }
@@ -504,6 +555,8 @@ pub fn stats(since: Option<&str>) -> Result<()> {
     let (mut check, mut compile, mut n) = (0.0, 0.0, 0usize);
     let mut saved_ms = 0.0;
     let mut older = 0usize;
+    let mut reuse_cost: Vec<f64> = Vec::new();
+    let mut phase_sum: BTreeMap<String, f64> = BTreeMap::new();
     for line in data.lines() {
         let Ok(ev) = serde_json::from_str::<Event>(line) else { continue };
         if ev.ts < cutoff {
@@ -515,6 +568,12 @@ pub fn stats(since: Option<&str>) -> Result<()> {
         e.1 += ev.compile_ms;
         if ev.decision.starts_with("reuse") && ev.record > 0 {
             older += 1;
+        }
+        if ev.decision.starts_with("reuse") && !ev.decision.contains("failed") {
+            reuse_cost.push(ev.total_ms - ev.compile_ms);
+            for (k, v) in &ev.phases {
+                *phase_sum.entry(k.clone()).or_default() += v;
+            }
         }
         if !ev.shadow.is_empty() {
             let k = if ev.shadow.starts_with("mismatch") { "mismatch".to_string() } else { ev.shadow.clone() };
@@ -557,5 +616,20 @@ pub fn stats(since: Option<&str>) -> Result<()> {
         }
     }
     println!("gocut overhead (check+patch): {:.1}s total; compile: {:.1}s total", check / 1000.0, compile / 1000.0);
+    if !reuse_cost.is_empty() {
+        reuse_cost.sort_by(f64::total_cmp);
+        let q = |f: f64| reuse_cost[((reuse_cost.len() - 1) as f64 * f).round() as usize];
+        println!(
+            "gocut time per reused package (excluding compiles): median {:.0} ms, p90 {:.0} ms, mean {:.0} ms",
+            q(0.5),
+            q(0.9),
+            reuse_cost.iter().sum::<f64>() / reuse_cost.len() as f64
+        );
+        let mut ps: Vec<_> = phase_sum.into_iter().collect();
+        ps.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let line: Vec<String> =
+            ps.iter().map(|(k, v)| format!("{k} {:.1}", v / reuse_cost.len() as f64)).collect();
+        println!("  mean ms by phase: {}", line.join(", "));
+    }
     Ok(())
 }

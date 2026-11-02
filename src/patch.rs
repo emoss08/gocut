@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+
+use crate::fx::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use anyhow::{Context, Result, ensure};
@@ -7,7 +9,7 @@ use crate::ar;
 use crate::export::{self, Export};
 use crate::goobj::{HASH_SIZE, Hasher, Obj, SYMREF_SIZE, SymRef};
 use crate::pkgbits::{self, Section};
-use crate::store::LsymTable;
+use crate::store::{LsymTable, timed};
 
 #[derive(Debug)]
 pub struct Guard(pub String);
@@ -37,14 +39,14 @@ pub fn lsym_table(ex: &Export) -> LsymTable {
 
 #[derive(Default)]
 struct IndexMaps<'a> {
-    old_to_ident: HashMap<(&'a str, i64), (&'a str, usize)>,
-    new_vals: HashMap<(&'a str, &'a str), &'a [i64]>,
-    moved_paths: HashSet<&'a str>,
+    old_to_ident: FxHashMap<(&'a str, i64), (&'a str, usize)>,
+    new_vals: FxHashMap<(&'a str, &'a str), &'a [i64]>,
+    moved_paths: FxHashSet<&'a str>,
 }
 
 fn index_maps<'a>(deps: &[ChangedDep<'a>]) -> Result<IndexMaps<'a>> {
     let mut m = IndexMaps::default();
-    let mut old_vals: HashMap<(&'a str, &'a str), &'a [i64]> = HashMap::new();
+    let mut old_vals: FxHashMap<(&'a str, &'a str), &'a [i64]> = FxHashMap::default();
     for d in deps {
         for (path, name, vals) in d.old_lsyms {
             for (s, &v) in vals.iter().enumerate() {
@@ -74,9 +76,9 @@ struct Walk<'w, 'x> {
     p: &'x Export<'x>,
     o: &'x Export<'x>,
     n: &'x Export<'x>,
-    seen: &'w mut HashSet<(Section, u32, u32, u32)>,
-    decided: &'w mut HashMap<(Section, u32), &'x [u8]>,
-    replaced: &'w mut HashMap<usize, Vec<u8>>,
+    seen: &'w mut FxHashSet<(Section, u32, u32, u32)>,
+    decided: &'w mut FxHashMap<(Section, u32), &'x [u8]>,
+    replaced: &'w mut FxHashMap<usize, Vec<u8>>,
 }
 
 impl Walk<'_, '_> {
@@ -135,15 +137,28 @@ struct PkgdefPatch {
     bytes: Option<Vec<u8>>,
     old_fp: [u8; 8],
     new_fp: [u8; 8],
+    equivalent: bool,
+}
+
+// The rewritten export data hashes like the old one if every replaced element masks to the same bytes
+// when parsed in its new context. Relocs, strings, names and Meta are never replaced.
+fn masks_equal(old: &Export, new_bits: &[u8], self_path: &str, new_inliner: bool, abs: &[usize]) -> bool {
+    let Ok(new) = Export::parse(new_bits, self_path, new_inliner) else { return false };
+    abs.iter().all(|&a| {
+        let Some((k, idx)) = old.pb.section_of(a) else { return false };
+        matches!(k, Section::Obj | Section::ObjExt | Section::Type | Section::PosBase)
+            && matches!((old.masked_payload(k, idx), new.masked_payload(k, idx)), (Ok(x), Ok(y)) if x == y)
+    })
 }
 
 fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Result<PkgdefPatch> {
     let loc = export::locate(pkgdef)?;
-    let ex = Export::parse(&pkgdef[loc.bits_start..loc.bits_end], self_path, loc.new_inliner)?;
+    let ex = timed("p_self_parse", || Export::parse(&pkgdef[loc.bits_start..loc.bits_end], self_path, loc.new_inliner))?;
     let old_fp = ex.pb.fingerprint;
-    let mut seen: Vec<HashSet<(Section, u32, u32, u32)>> = vec![HashSet::new(); changed.len()];
-    let mut decided: HashMap<(Section, u32), &[u8]> = HashMap::new();
-    let mut replaced: HashMap<usize, Vec<u8>> = HashMap::new();
+    let tw = std::time::Instant::now();
+    let mut seen: Vec<FxHashSet<(Section, u32, u32, u32)>> = vec![FxHashSet::default(); changed.len()];
+    let mut decided: FxHashMap<(Section, u32), &[u8]> = FxHashMap::default();
+    let mut replaced: FxHashMap<usize, Vec<u8>> = FxHashMap::default();
     for (i, id) in ex.idents.iter().enumerate() {
         if id.path == self_path || id.tag == export::Tag::Stub {
             continue;
@@ -157,21 +172,25 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Resul
         Walk { p: &ex, o: d.old, n: d.new, seen: &mut seen[di], decided: &mut decided, replaced: &mut replaced }
             .run(Section::Obj, i as u32, io, inn)?;
     }
+    crate::store::add_phase("p_walk", tw.elapsed().as_secs_f64() * 1000.0);
     if replaced.is_empty() {
-        return Ok(PkgdefPatch { bytes: None, old_fp, new_fp: old_fp });
+        return Ok(PkgdefPatch { bytes: None, old_fp, new_fp: old_fp, equivalent: true });
     }
+    let mut abs: Vec<usize> = replaced.keys().copied().collect();
+    abs.sort_unstable();
     let elems: Vec<Vec<u8>> = (0..ex.pb.elem_ends.len())
         .map(|a| replaced.remove(&a).unwrap_or_else(|| ex.pb.raw_abs(a).to_vec()))
         .collect();
     let nb = pkgbits::dump(ex.pb.version, ex.pb.flags, &ex.pb.ends_ends, &elems);
     let mut new_fp = [0u8; 8];
     new_fp.copy_from_slice(&nb[nb.len() - 8..]);
+    let equivalent = timed("p_equiv", || masks_equal(&ex, &nb, self_path, loc.new_inliner, &abs));
     let tail = &pkgdef[loc.bits_end..];
     let mut out = Vec::with_capacity(loc.bits_start + nb.len() + tail.len());
     out.extend_from_slice(&pkgdef[..loc.bits_start]);
     out.extend_from_slice(&nb);
     out.extend_from_slice(tail);
-    Ok(PkgdefPatch { bytes: Some(out), old_fp, new_fp })
+    Ok(PkgdefPatch { bytes: Some(out), old_fp, new_fp, equivalent })
 }
 
 fn moved_types<'n>(d: &ChangedDep, want: &HashSet<&'n str>) -> Result<HashSet<&'n str>> {
@@ -385,6 +404,8 @@ fn rewrite_build_id(members: &mut [ar::Member], old_buildid: &str, new_buildid: 
 pub struct Patched {
     pub bytes: Vec<u8>,
     pub remapped_refs: usize,
+    /// Old and new export data fingerprints, when the new export data hashes exactly like the old.
+    pub equivalent: Option<([u8; 8], [u8; 8])>,
 }
 
 pub struct Target<'a> {
@@ -397,31 +418,35 @@ pub struct Target<'a> {
 
 pub fn patch(t: &Target, changed: &[ChangedDep], new_fps: &HashMap<String, [u8; 8]>) -> Result<Patched> {
     let Target { old_archive, self_path, old_buildid, new_buildid, full_dwarf } = *t;
-    let mut members = ar::parse(old_archive)?;
-    let maps = index_maps(changed)?;
+    let mut members = timed("p_ar", || ar::parse(old_archive))?;
+    let maps = timed("p_index_maps", || index_maps(changed))?;
 
     let pi = members.iter().position(|m| m.name == "__.PKGDEF").context("no __.PKGDEF")?;
     let oi = members.iter().position(|m| m.name == "_go_.o").context("no _go_.o")?;
 
-    let pkgdef = patch_pkgdef(&members[pi].data, self_path, changed)?;
+    let pkgdef = timed("p_pkgdef", || patch_pkgdef(&members[pi].data, self_path, changed))?;
+    let equivalent = (pkgdef.equivalent && pkgdef.old_fp != pkgdef.new_fp).then_some((pkgdef.old_fp, pkgdef.new_fp));
     if let Some(bytes) = pkgdef.bytes {
         members[pi].data = bytes;
     }
 
     let mut b = std::mem::take(&mut members[oi].data);
-    let obj = Obj::parse(&b)?;
-    let pkgs = obj.pkg_index(&b);
-    let mut sites = obj.symref_sites(&b);
-    sites.sort_unstable();
-    sites.dedup();
+    let (obj, pkgs, sites) = timed("p_sites", || -> Result<_> {
+        let obj = Obj::parse(&b)?;
+        let pkgs = obj.pkg_index(&b);
+        let mut sites = obj.symref_sites(&b);
+        sites.sort_unstable();
+        sites.dedup();
+        Ok((obj, pkgs, sites))
+    })?;
 
     if full_dwarf {
         guard_moved_methods(&b, &sites, &pkgs, changed, &maps)?;
     }
     let fo = obj.fingerprint_off();
     ensure!(b[fo..fo + 8] == pkgdef.old_fp, "object fingerprint does not match export data");
-    let remaps = remap_symrefs(&b, &sites, &pkgs, &maps)?;
-    let plan = reproduce_hashes(&obj, &b, self_path, &remaps)?;
+    let remaps = timed("p_remap", || remap_symrefs(&b, &sites, &pkgs, &maps))?;
+    let plan = timed("p_rehash", || reproduce_hashes(&obj, &b, self_path, &remaps))?;
 
     b[fo..fo + 8].copy_from_slice(&pkgdef.new_fp);
     for (pkg, off) in obj.autolib(&b) {
@@ -433,10 +458,10 @@ pub fn patch(t: &Target, changed: &[ChangedDep], new_fps: &HashMap<String, [u8; 
         Obj::set_symref(&mut b, site, r);
     }
     if let Some(plan) = &plan {
-        rehash(&obj, &mut b, self_path, plan)?;
+        timed("p_rehash", || rehash(&obj, &mut b, self_path, plan))?;
     }
     members[oi].data = b;
 
     rewrite_build_id(&mut members, old_buildid, new_buildid)?;
-    Ok(Patched { bytes: ar::write(&members), remapped_refs: remaps.len() })
+    Ok(Patched { bytes: timed("p_ar", || ar::write(&members)), remapped_refs: remaps.len(), equivalent })
 }

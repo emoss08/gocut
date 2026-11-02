@@ -113,6 +113,12 @@ impl<'a> PkgBits<'a> {
         Ok(a)
     }
 
+    pub fn section_of(&self, a: usize) -> Option<(Section, u32)> {
+        let k = self.ends_ends.iter().position(|&e| a < e as usize)?;
+        let base = if k > 0 { self.ends_ends[k - 1] as usize } else { 0 };
+        Some((Section::from_u64(k as u64).ok()?, (a - base) as u32))
+    }
+
     pub fn raw_abs(&self, a: usize) -> &'a [u8] {
         let start = if a > 0 { self.elem_ends[a - 1] as usize } else { 0 };
         &self.data[start..self.elem_ends[a] as usize]

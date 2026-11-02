@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+
+use crate::fx::FxHashMap;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -126,10 +128,10 @@ pub struct Export<'a> {
     pub idents: Vec<ObjIdent>,
     self_pkg: u32,
     new_inliner: bool,
-    by_ident: HashMap<String, HashMap<String, u32>>,
-    bodies: HashMap<u32, Vec<u32>>,
-    objs: RefCell<HashMap<u32, Rc<ObjInfo>>>,
-    nodes: RefCell<HashMap<usize, Rc<Node>>>,
+    by_ident: FxHashMap<String, FxHashMap<String, u32>>,
+    bodies: FxHashMap<u32, Vec<u32>>,
+    objs: RefCell<FxHashMap<u32, Rc<ObjInfo>>>,
+    nodes: RefCell<FxHashMap<usize, Rc<Node>>>,
 }
 
 struct ER<'a, 'b> {
@@ -390,7 +392,7 @@ impl<'a> Export<'a> {
 
         let n = pb.num(Section::Name);
         let mut idents = Vec::with_capacity(n);
-        let mut by_ident: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        let mut by_ident: FxHashMap<String, FxHashMap<String, u32>> = FxHashMap::default();
         let mut paths = HashMap::new();
         for i in 0..n as u32 {
             let id = read_ident(&pb, self_path, i, &mut paths)?;
@@ -399,7 +401,7 @@ impl<'a> Export<'a> {
                     names.insert(id.name.clone(), i);
                 }
                 None => {
-                    by_ident.insert(id.path.clone(), HashMap::from([(id.name.clone(), i)]));
+                    by_ident.insert(id.path.clone(), FxHashMap::from_iter([(id.name.clone(), i)]));
                 }
             }
             idents.push(id);
@@ -416,7 +418,7 @@ impl<'a> Export<'a> {
             let body = pr.reloc(Section::Body)?;
             by_base.entry(path).or_default().entry(body_base(&name).to_string()).or_default().push(body);
         }
-        let mut bodies = HashMap::new();
+        let mut bodies = FxHashMap::default();
         if !by_base.is_empty() {
             for (i, id) in idents.iter().enumerate() {
                 if let Some(bs) = by_base.get(&id.path).and_then(|names| names.get(&id.name)) {
@@ -693,7 +695,7 @@ impl<'a> Export<'a> {
         k: Section,
         idx: u32,
         h: &mut blake3::Hasher,
-        ord: &mut HashMap<(Section, u32), u32>,
+        ord: &mut FxHashMap<(Section, u32), u32>,
     ) -> Result<Option<Rc<Node>>> {
         if let Some(o) = ord.get(&(k, idx)) {
             h.update(&[1]);
@@ -726,7 +728,7 @@ impl<'a> Export<'a> {
             next: usize,
         }
         let mut h = blake3::Hasher::new();
-        let mut ord: HashMap<(Section, u32), u32> = HashMap::new();
+        let mut ord: FxHashMap<(Section, u32), u32> = FxHashMap::default();
         let mut stack: Vec<Frame> = Vec::new();
         if let Some(node) = self.enter(k0, i0, &mut h, &mut ord)? {
             stack.push(Frame { node, next: 0 });

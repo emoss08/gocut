@@ -1,5 +1,6 @@
 mod ar;
 mod export;
+mod fx;
 mod goobj;
 mod patch;
 mod pkgbits;
@@ -17,7 +18,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::export::Export;
-use crate::store::{Event, LsymTable, Record, Store, env_or};
+use crate::store::{Event, LsymTable, Record, Store, env_or, timed};
 use crate::usage::Roots;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -254,15 +255,18 @@ struct Prep {
 }
 
 fn prepare(st: &Store, tool: &str, ca: &CompileArgs) -> Result<Prep> {
-    let key = compile_key(st, tool, ca)?;
+    let key = timed("key", || compile_key(st, tool, ca))?;
     let cfg = match &ca.importcfg {
         Some(p) => read_importcfg(p)?,
         None => ImportCfg::default(),
     };
     let mut deps = BTreeMap::new();
-    for (k, p) in &cfg.files {
-        deps.insert(k.clone(), DepInfo::load(p)?);
-    }
+    timed("dep_fps", || -> Result<()> {
+        for (k, p) in &cfg.files {
+            deps.insert(k.clone(), DepInfo::load(p)?);
+        }
+        Ok(())
+    })?;
     let fps = deps.iter().map(|(k, d)| (k.clone(), hex8(&d.fp))).collect();
     Ok(Prep { key, cfg, deps, fps })
 }
@@ -316,7 +320,7 @@ enum Decision {
     Unsupported(Unsupported),
     PrepareFailed(String),
     Blocked { kind: BlockKind, reason: String },
-    Reuse { patched: Vec<u8>, remapped: usize, changed: usize },
+    Reuse { patched: Vec<u8>, remapped: usize, changed: usize, equivalent: Option<([u8; 8], [u8; 8])> },
 }
 
 impl Decision {
@@ -339,6 +343,17 @@ fn changed_deps(rec: &Record, fps: &BTreeMap<String, String>) -> Option<Vec<Stri
         return None;
     }
     Some(fps.iter().filter(|&(k, v)| &rec.deps[k] != v).map(|(k, _)| k.clone()).collect())
+}
+
+fn pkg_facts(st: &Store, fp: &str, ex: &Export) -> Result<(String, bool, String)> {
+    if let Some(f) = st.read_pkg_facts(fp) {
+        return Ok(f);
+    }
+    let f = timed("pkg_hash", || -> Result<_> {
+        Ok((ex.self_name.clone(), ex.has_init, blake3::Hash::from(ex.pkg_hash()?).to_hex().to_string()))
+    })?;
+    let _ = st.write_pkg_facts(fp, &f);
+    Ok(f)
 }
 
 struct HashCache<'a> {
@@ -392,25 +407,33 @@ fn decide(
         }
         let fp = &rec.deps[p];
         if let Entry::Vacant(slot) = olds.entry(fp.clone()) {
-            slot.insert(st.read_export(fp).with_context(|| format!("old export data of {p}"))?);
+            slot.insert(timed("read_old_export", || st.read_export(fp)).with_context(|| format!("old export data of {p}"))?);
         }
     }
     let olds = &*olds;
     let mut pairs = Vec::with_capacity(changed.len());
     for p in changed {
         let (d, ofp, nfp) = (&prep.deps[p], rec.deps[p].as_str(), prep.fps[p].as_str());
-        let ni = d.new_inliner()?;
-        let old = Export::parse(&olds[ofp], p, ni)?;
-        let new = Export::parse(d.bits()?, p, ni)?;
-        if old.self_name != new.self_name || old.has_init != new.has_init {
+        let ni = timed("read_new_export", || d.new_inliner())?;
+        let old = timed("parse_dep", || Export::parse(&olds[ofp], p, ni))?;
+        let new = timed("parse_dep", || Export::parse(d.bits()?, p, ni))?;
+        let _ = timed("write_export", || st.write_export(nfp, d.bits()?));
+        let (oc, nc) = (st.canonical(ofp), st.canonical(nfp));
+        if oc == nc {
+            // gocut produced the new export data from the old by moving positions only; it hashes the same.
+            pairs.push((ofp, nfp, old, new));
+            continue;
+        }
+        let (of, nf) = (pkg_facts(st, &oc, &old)?, pkg_facts(st, &nc, &new)?);
+        if of.0 != nf.0 || of.1 != nf.1 {
             return Ok(Decision::blocked(BlockKind::PkgIdentity, format!("{p}: package name or init changed")));
         }
-        if old.pkg_hash()? != new.pkg_hash()? {
+        if of.2 != nf.2 {
             return Ok(Decision::blocked(BlockKind::ImportGraph, format!("{p}: import graph changed")));
         }
-        let _ = st.write_export(nfp, d.bits()?);
         if let Some(names) = rec.roots.names.get(p) {
-            let (mut oc, mut nc) = (HashCache::open(st, ofp), HashCache::open(st, nfp));
+            let _t = std::time::Instant::now();
+            let (mut oc, mut nc) = (HashCache::open(st, &oc), HashCache::open(st, &nc));
             let mut differs = None;
             for n in names {
                 if oc.get(&old, p, n)? != nc.get(&new, p, n)? {
@@ -420,21 +443,23 @@ fn decide(
             }
             oc.flush(st);
             nc.flush(st);
+            store::add_phase("uses", ms(_t));
             if let Some(n) = differs {
                 return Ok(Decision::blocked(BlockKind::UsesChanged, format!("uses changed {p}.{n}")));
             }
         }
         pairs.push((ofp, nfp, old, new));
     }
-    let lsyms: Vec<(LsymTable, LsymTable)> =
-        pairs.iter().map(|(ofp, nfp, old, new)| (lsyms_for(st, ofp, old), lsyms_for(st, nfp, new))).collect();
+    let lsyms: Vec<(LsymTable, LsymTable)> = timed("lsyms", || {
+        pairs.iter().map(|(ofp, nfp, old, new)| (lsyms_for(st, ofp, old), lsyms_for(st, nfp, new))).collect()
+    });
     let deps: Vec<patch::ChangedDep> = pairs
         .iter()
         .zip(&lsyms)
         .map(|((_, _, old, new), (ol, nl))| patch::ChangedDep { old, new, old_lsyms: ol, new_lsyms: nl })
         .collect();
     let new_fps: HashMap<String, [u8; 8]> = prep.deps.iter().map(|(k, d)| (k.clone(), d.fp)).collect();
-    let old_out = st.read_blob(&rec.out)?;
+    let old_out = timed("read_blob", || st.read_blob(&rec.out))?;
     let target = patch::Target {
         old_archive: &old_out,
         self_path: &ca.pkg,
@@ -442,8 +467,8 @@ fn decide(
         new_buildid: &ca.buildid,
         full_dwarf: ca.full_dwarf,
     };
-    let p = patch::patch(&target, &deps, &new_fps)?;
-    Ok(Decision::Reuse { patched: p.bytes, remapped: p.remapped_refs, changed: deps.len() })
+    let p = timed("patch", || patch::patch(&target, &deps, &new_fps))?;
+    Ok(Decision::Reuse { patched: p.bytes, remapped: p.remapped_refs, changed: deps.len(), equivalent: p.equivalent })
 }
 
 fn is_evicted(e: &anyhow::Error) -> bool {
@@ -508,21 +533,65 @@ fn exec_tool(tool: &str, args: &[String]) -> anyhow::Error {
     anyhow::anyhow!("exec {tool}: {err}")
 }
 
-fn save_record(st: &Store, ca: &CompileArgs, prep: &Prep, recs: &[Record], roots: Roots, out: &[u8]) -> Result<()> {
+struct Pending {
+    key: String,
+    rec: Record,
+    recs: Vec<Record>,
+    exports: Vec<(String, Vec<u8>)>,
+}
+
+// Reads every input the record needs now, while the sources and dependency archives are as compiled.
+fn pending_record(st: &Store, ca: &CompileArgs, prep: &Prep, recs: Vec<Record>) -> Result<Pending> {
+    let roots = match recs.first() {
+        Some(r) => r.roots.clone(),
+        None => compute_roots(ca, prep)?,
+    };
+    let mut exports = Vec::new();
     for (k, d) in &prep.deps {
         let fp = &prep.fps[k];
         if !st.has_export(fp) {
-            st.write_export(fp, d.bits()?)?;
+            exports.push((fp.clone(), d.bits()?.to_vec()));
         }
     }
-    let rec = Record {
-        pkg: ca.pkg.clone(),
-        buildid: ca.buildid.clone(),
-        out: st.write_blob(out)?,
-        deps: prep.fps.clone(),
-        roots,
-    };
-    st.write_record(&prep.key, &rec, recs)
+    let rec =
+        Record { pkg: ca.pkg.clone(), buildid: ca.buildid.clone(), out: String::new(), deps: prep.fps.clone(), roots };
+    Ok(Pending { key: prep.key.clone(), rec, recs, exports })
+}
+
+fn save_record(st: &Store, mut p: Pending, out: &[u8]) -> Result<()> {
+    timed("rec_exports", || p.exports.iter().try_for_each(|(fp, bits)| st.write_export(fp, bits)))?;
+    p.rec.out = timed("rec_blob", || st.write_blob(out))?;
+    timed("rec_json", || st.write_record(&p.key, &p.rec, &p.recs))
+}
+
+// Saving the record only matters to later builds, so it runs in a detached child and the compile
+// step returns as soon as its output is in place. Returns true in the child, false in the parent
+// (which should exit now), and true without forking if detaching is off or fails.
+fn detach() -> bool {
+    if std::env::var("GOCUT_DETACH").is_ok_and(|v| v == "0") {
+        return true;
+    }
+    // SAFETY: gocut is single-threaded here; the child only runs ordinary Rust code afterwards.
+    match unsafe { libc::fork() } {
+        0 => {
+            // SAFETY: plain syscalls on file descriptors this process owns.
+            unsafe {
+                libc::setsid();
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                if null >= 0 {
+                    for fd in 0..3 {
+                        libc::dup2(null, fd);
+                    }
+                    if null > 2 {
+                        libc::close(null);
+                    }
+                }
+            }
+            true
+        }
+        pid if pid > 0 => false,
+        _ => true,
+    }
 }
 
 fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
@@ -555,6 +624,7 @@ fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
 
     ev.decision = decision.name().to_string();
     ev.tried = tried;
+    let mut equivalent = None;
     let patched = match decision {
         Decision::NoRecord => None,
         Decision::Unsupported(u) => {
@@ -572,17 +642,19 @@ fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
             ev.reason = reason;
             None
         }
-        Decision::Reuse { patched, remapped, changed } => {
+        Decision::Reuse { patched, remapped, changed, equivalent: eq } => {
             ev.record = tried - 1;
             ev.remapped = remapped;
             ev.changed_deps = changed;
+            equivalent = eq;
             Some(patched)
         }
     };
+    let patched_len = patched.as_ref().map(Vec::len);
 
     let output = match patched {
         Some(p) if m == Mode::Active && !sampled(&ca) => {
-            std::fs::write(&ca.out, &p)?;
+            timed("write_out", || std::fs::write(&ca.out, &p))?;
             p
         }
         patched => {
@@ -595,6 +667,7 @@ fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
             ev.compiled = true;
             if !status.success() {
                 ev.decision = format!("{}+compile-failed", ev.decision);
+                ev.phases = store::take_phases();
                 st.log(&ev);
                 return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
             }
@@ -619,22 +692,36 @@ fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
         }
     };
 
-    if let Some(p) = &prep {
-        let tr = Instant::now();
-        let roots = match recs.first() {
-            Some(r) => Ok(r.roots.clone()),
-            None => compute_roots(&ca, p),
-        };
-        if let Err(e) = roots.and_then(|roots| save_record(&st, &ca, p, &recs, roots, &output)) {
-            ev.reason = format!("{} record failed: {e:#}", ev.reason);
-        }
-        ev.record_ms = ms(tr);
+    // The output is the patched archive (active reuse, or a verified match): its export data hashes like the old.
+    if let Some((o, n)) = equivalent
+        && (ev.shadow == "match" || (!ev.compiled && patched_len == Some(output.len())))
+    {
+        let _ = st.link_same(&hex8(&n), &st.canonical(&hex8(&o)));
     }
-    let tg = Instant::now();
-    st.maybe_evict();
-    ev.gc_ms = ms(tg);
+    let pending = prep.as_ref().map(|p| timed("rec_read", || pending_record(&st, &ca, p, recs)));
     ev.total_ms = ms(t0);
+    ev.phases = store::take_phases();
+    let pending = match pending {
+        Some(Err(e)) => {
+            ev.reason = format!("{} record failed: {e:#}", ev.reason);
+            None
+        }
+        Some(Ok(p)) => Some(p),
+        None => None,
+    };
     st.log(&ev);
+    if !detach() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(p) = pending
+        && let Err(e) = save_record(&st, p, &output)
+    {
+        let mut fail = Event::new(&ca.pkg);
+        fail.decision = "record-failed".into();
+        fail.reason = format!("record failed: {e:#}");
+        st.log(&fail);
+    }
+    st.maybe_evict();
     Ok(ExitCode::SUCCESS)
 }
 
