@@ -13,7 +13,7 @@ const FIRST_DATA: usize = MAGIC.len() + HEADER_LEN;
 const PKGDEF: &str = "__.PKGDEF";
 const EXPORT_TRAILER: &[u8] = b"\n$$\n";
 
-pub struct Member {
+pub(crate) struct Member {
     pub name: String,
     pub header: Vec<u8>,
     pub data: Vec<u8>,
@@ -25,7 +25,7 @@ fn header(h: &[u8]) -> Result<(String, usize)> {
     Ok((name, size))
 }
 
-pub fn parse(b: &[u8]) -> Result<Vec<Member>> {
+pub(crate) fn parse(b: &[u8]) -> Result<Vec<Member>> {
     ensure!(b.starts_with(MAGIC), "not an archive");
     let mut i = MAGIC.len();
     let mut out = Vec::new();
@@ -40,7 +40,7 @@ pub fn parse(b: &[u8]) -> Result<Vec<Member>> {
     Ok(out)
 }
 
-pub fn write(members: &[Member]) -> Vec<u8> {
+pub(crate) fn write(members: &[Member]) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     for m in members {
         let mut h = m.header.clone();
@@ -55,7 +55,7 @@ pub fn write(members: &[Member]) -> Vec<u8> {
     out
 }
 
-pub fn member_data<'b>(b: &'b [u8], want: &str) -> Option<&'b [u8]> {
+pub(crate) fn member_data<'b>(b: &'b [u8], want: &str) -> Option<&'b [u8]> {
     let mut i = MAGIC.len();
     if !b.starts_with(MAGIC) {
         return None;
@@ -71,7 +71,7 @@ pub fn member_data<'b>(b: &'b [u8], want: &str) -> Option<&'b [u8]> {
     None
 }
 
-pub fn member<'m>(ms: &'m [Member], name: &str) -> Option<&'m Member> {
+pub(crate) fn member<'m>(ms: &'m [Member], name: &str) -> Option<&'m Member> {
     ms.iter().find(|m| m.name == name)
 }
 
@@ -85,14 +85,14 @@ fn open_pkgdef(path: &Path) -> Result<(File, usize)> {
     Ok((f, size))
 }
 
-pub fn read_pkgdef(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_pkgdef(path: &Path) -> Result<Vec<u8>> {
     let (mut f, size) = open_pkgdef(path)?;
     let mut data = vec![0u8; size];
     f.read_exact(&mut data)?;
     Ok(data)
 }
 
-pub fn read_pkgdef_fingerprint(path: &Path) -> Result<[u8; 8]> {
+pub(crate) fn read_pkgdef_fingerprint(path: &Path) -> Result<[u8; 8]> {
     let (mut f, size) = open_pkgdef(path)?;
     ensure!(size >= 12, "export data too short");
     f.seek(SeekFrom::Start((FIRST_DATA + size - 12) as u64))?;

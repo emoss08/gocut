@@ -6,6 +6,8 @@ mod patch;
 mod pkgbits;
 mod store;
 mod usage;
+#[cfg(target_os = "linux")]
+mod watch;
 
 use std::cell::OnceCell;
 use std::collections::hash_map::Entry;
@@ -17,7 +19,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use crate::export::Export;
+use crate::export::{Export, Inliner};
 use crate::store::{Event, LsymTable, Record, Store, env_or, timed};
 use crate::usage::Roots;
 
@@ -78,6 +80,7 @@ struct CompileArgs {
 
 const VALUE_FLAGS: [&str; 5] = ["-o", "-p", "-importcfg", "-buildid", "-embedcfg"];
 
+#[expect(clippy::case_sensitive_file_extension_comparisons, reason = "the go command matches .go case-sensitively")]
 fn parse_args(args: &[String]) -> Result<CompileArgs> {
     let mut vals: [Option<&str>; VALUE_FLAGS.len()] = [None; VALUE_FLAGS.len()];
     let mut files = Vec::new();
@@ -233,12 +236,12 @@ impl DepInfo {
         Ok(&x.pkgdef[x.file.bits_start..x.file.bits_end])
     }
 
-    fn new_inliner(&self) -> Result<bool> {
-        Ok(self.export()?.file.new_inliner)
+    fn inliner(&self) -> Result<Inliner> {
+        Ok(self.export()?.file.inliner)
     }
 }
 
-fn hex8(b: &[u8; 8]) -> String {
+fn hex8(b: [u8; 8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     b.iter().flat_map(|&x| [HEX[usize::from(x >> 4)], HEX[usize::from(x & 15)]]).map(char::from).collect()
 }
@@ -267,7 +270,7 @@ fn prepare(st: &Store, tool: &str, ca: &CompileArgs) -> Result<Prep> {
         }
         Ok(())
     })?;
-    let fps = deps.iter().map(|(k, d)| (k.clone(), hex8(&d.fp))).collect();
+    let fps = deps.iter().map(|(k, d)| (k.clone(), hex8(d.fp))).collect();
     Ok(Prep { key, cfg, deps, fps })
 }
 
@@ -345,7 +348,7 @@ fn changed_deps(rec: &Record, fps: &BTreeMap<String, String>) -> Option<Vec<Stri
     Some(fps.iter().filter(|&(k, v)| &rec.deps[k] != v).map(|(k, _)| k.clone()).collect())
 }
 
-fn pkg_facts(st: &Store, fp: &str, ex: &Export) -> Result<(String, bool, String)> {
+fn pkg_facts(st: &Store, fp: &str, ex: &Export<'_>) -> Result<(String, bool, String)> {
     if let Some(f) = st.read_pkg_facts(fp) {
         return Ok(f);
     }
@@ -367,7 +370,7 @@ impl<'a> HashCache<'a> {
         HashCache { fp, cur: st.read_hashes(fp), add: Vec::new() }
     }
 
-    fn get(&mut self, ex: &Export, path: &str, name: &str) -> Result<String> {
+    fn get(&mut self, ex: &Export<'_>, path: &str, name: &str) -> Result<String> {
         if let Some(h) = self.cur.get(name) {
             return Ok(h.clone());
         }
@@ -385,7 +388,7 @@ impl<'a> HashCache<'a> {
     }
 }
 
-fn lsyms_for(st: &Store, fp: &str, ex: Option<&Export>) -> Result<LsymTable> {
+fn lsyms_for(st: &Store, fp: &str, ex: Option<&Export<'_>>) -> Result<LsymTable> {
     if let Some(t) = st.read_lsyms(fp) {
         return Ok(t);
     }
@@ -394,18 +397,27 @@ fn lsyms_for(st: &Store, fp: &str, ex: Option<&Export>) -> Result<LsymTable> {
     Ok(t)
 }
 
-
 // The non-local names an archive's own export data carries copies of.
 fn copied_idents(archive: &[u8], self_path: &str) -> Result<Vec<(String, String)>> {
     let pkgdef = ar::member_data(archive, "__.PKGDEF").context("no __.PKGDEF")?;
     let loc = export::locate(pkgdef)?;
-    let ex = Export::parse(&pkgdef[loc.bits_start..loc.bits_end], self_path, loc.new_inliner)?;
+    let ex = Export::parse(&pkgdef[loc.bits_start..loc.bits_end], self_path, loc.inliner)?;
     Ok(ex
         .idents
         .into_iter()
         .filter(|id| id.path != self_path && id.tag != export::Tag::Stub)
         .map(|id| (id.path, id.name))
         .collect())
+}
+
+// A dependency whose export data changed since the record, as decide sees it.
+struct Dep<'x> {
+    p: &'x str,
+    ofp: &'x str,
+    nfp: &'x str,
+    new: Export<'x>,
+    canon: (String, String),
+    need_old: bool,
 }
 
 fn decide(
@@ -421,18 +433,10 @@ fn decide(
             return Ok(Decision::blocked(BlockKind::DotImport, format!("dot import of {p}")));
         }
     }
-    struct Dep<'x> {
-        p: &'x str,
-        ofp: &'x str,
-        nfp: &'x str,
-        new: Export<'x>,
-        canon: (String, String),
-        need_old: bool,
-    }
     let mut ds = Vec::with_capacity(changed.len());
     for p in changed {
         let (d, ofp, nfp) = (&prep.deps[p], rec.deps[p].as_str(), prep.fps[p].as_str());
-        let ni = timed("read_new_export", || d.new_inliner())?;
+        let ni = timed("read_new_export", || d.inliner())?;
         let new = timed("parse_dep", || Export::parse(d.bits()?, p, ni))?;
         let _ = timed("write_export", || st.write_export(nfp, d.bits()?));
         let canon = (st.canonical(ofp), st.canonical(nfp));
@@ -445,14 +449,14 @@ fn decide(
         let out = old_out.insert(timed("read_blob", || st.read_blob(&rec.out))?);
         let copied = timed("copied", || copied_idents(out, &ca.pkg))?;
         for d in ds.iter_mut().filter(|d| d.canon.0 == d.canon.1) {
-            d.need_old =
-                !st.has_lsyms(d.ofp) || copied.iter().any(|(path, name)| d.new.find(path, name).is_some());
+            d.need_old = !st.has_lsyms(d.ofp) || copied.iter().any(|(path, name)| d.new.find(path, name).is_some());
         }
     }
     for d in ds.iter().filter(|d| d.need_old) {
         if let Entry::Vacant(slot) = olds.entry(d.ofp.to_string()) {
             slot.insert(
-                timed("read_old_export", || st.read_export(d.ofp)).with_context(|| format!("old export data of {}", d.p))?,
+                timed("read_old_export", || st.read_export(d.ofp))
+                    .with_context(|| format!("old export data of {}", d.p))?,
             );
         }
     }
@@ -460,9 +464,10 @@ fn decide(
     let mut pairs = Vec::with_capacity(ds.len());
     for d in &ds {
         let p = d.p;
-        let old = match d.need_old {
-            true => Some(timed("parse_dep", || Export::parse(&olds[d.ofp], p, d.new.new_inliner()))?),
-            false => None,
+        let old = if d.need_old {
+            Some(timed("parse_dep", || Export::parse(&olds[d.ofp], p, d.new.inliner()))?)
+        } else {
+            None
         };
         let (oc, nc) = &d.canon;
         if oc == nc {
@@ -503,7 +508,7 @@ fn decide(
             .map(|(ofp, nfp, old, new)| Ok((lsyms_for(st, ofp, old.as_ref())?, lsyms_for(st, nfp, Some(new))?)))
             .collect::<Result<_>>()
     })?;
-    let deps: Vec<patch::ChangedDep> = pairs
+    let deps: Vec<patch::ChangedDep<'_>> = pairs
         .iter()
         .zip(&lsyms)
         .map(|((_, _, old, new), (ol, nl))| patch::ChangedDep { old: old.as_ref(), new, old_lsyms: ol, new_lsyms: nl })
@@ -538,13 +543,14 @@ fn try_decide(
 ) -> Decision {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decide(st, ca, rec, prep, changed, olds))) {
         Ok(Ok(d)) => d,
-        Ok(Err(e)) => match e.downcast_ref::<patch::Guard>() {
-            Some(g) => Decision::blocked(BlockKind::Guard, g.0.clone()),
-            None => {
+        Ok(Err(e)) => {
+            if let Some(g) = e.downcast_ref::<patch::Guard>() {
+                Decision::blocked(BlockKind::Guard, g.0.clone())
+            } else {
                 let kind = if is_evicted(&e) { BlockKind::Evicted } else { BlockKind::PatchFailed };
                 Decision::blocked(kind, format!("patch failed: {e:#}"))
             }
-        },
+        }
         Err(_) => Decision::blocked(BlockKind::PatchPanicked, "patch panicked"),
     }
 }
@@ -627,17 +633,18 @@ fn detach() -> bool {
     // SAFETY: gocut is single-threaded here; the child only runs ordinary Rust code afterwards.
     match unsafe { libc::fork() } {
         0 => {
-            // SAFETY: plain syscalls on file descriptors this process owns.
-            unsafe {
-                libc::setsid();
-                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-                if null >= 0 {
-                    for fd in 0..3 {
-                        libc::dup2(null, fd);
-                    }
-                    if null > 2 {
-                        libc::close(null);
-                    }
+            // SAFETY: setsid takes no arguments; the child is not a group leader, so it succeeds.
+            unsafe { libc::setsid() };
+            // SAFETY: the path is a NUL-terminated literal.
+            let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            if null >= 0 {
+                for fd in 0..3 {
+                    // SAFETY: null is an open descriptor this process owns; fd is 0, 1 or 2.
+                    unsafe { libc::dup2(null, fd) };
+                }
+                if null > 2 {
+                    // SAFETY: null is open, owned here, and no longer used.
+                    unsafe { libc::close(null) };
                 }
             }
             true
@@ -647,21 +654,22 @@ fn detach() -> bool {
     }
 }
 
-fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
+#[expect(clippy::too_many_lines, reason = "one linear pipeline from compile arguments to the logged event")]
+fn toolexec(tool: &str, args: &[String]) -> Result<ExitCode> {
     let m = mode();
-    let base = Path::new(&tool).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let base = Path::new(tool).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     if m == Mode::Off || base != "compile" || args.iter().any(|a| a.starts_with("-V")) {
-        return Err(exec_tool(&tool, &args));
+        return Err(exec_tool(tool, args));
     }
     let t0 = Instant::now();
-    let (Ok(ca), Ok(st)) = (parse_args(&args), Store::open()) else {
-        return Err(exec_tool(&tool, &args));
+    let (Ok(ca), Ok(st)) = (parse_args(args), Store::open()) else {
+        return Err(exec_tool(tool, args));
     };
     let mut ev = Event::new(&ca.pkg);
 
     let prep = match ca.unsupported {
         Some(u) => Err(Decision::Unsupported(u)),
-        None => prepare(&st, &tool, &ca).map_err(|e| Decision::PrepareFailed(format!("prepare failed: {e:#}"))),
+        None => prepare(&st, tool, &ca).map_err(|e| Decision::PrepareFailed(format!("prepare failed: {e:#}"))),
     };
     ev.prep_ms = ms(t0);
     let (prep, recs, decision, tried) = match prep {
@@ -715,14 +723,16 @@ fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
                 ev.decision = "reuse+verify".into();
             }
             let t1 = Instant::now();
-            let status = Command::new(&tool).args(&args).status()?;
+            let status = Command::new(tool).args(args).status()?;
             ev.compile_ms = ms(t1);
             ev.compiled = true;
             if !status.success() {
                 ev.decision = format!("{}+compile-failed", ev.decision);
                 ev.phases = store::take_phases();
                 st.log(&ev);
-                return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+                // A Unix exit code is 0 to 255; a signal death has none and counts as 1.
+                let code = status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(1);
+                return Ok(ExitCode::from(code));
             }
             let real = std::fs::read(&ca.out)?;
             if let Some(p) = &patched {
@@ -749,7 +759,7 @@ fn toolexec(tool: String, args: Vec<String>) -> Result<ExitCode> {
     if let Some((o, n)) = equivalent
         && (ev.shadow == "match" || (!ev.compiled && patched_len == Some(output.len())))
     {
-        let _ = st.link_same(&hex8(&n), &st.canonical(&hex8(&o)));
+        let _ = st.link_same(&hex8(n), &st.canonical(&hex8(o)));
     }
     let pending = prep.as_ref().map(|p| timed("rec_read", || pending_record(&st, &ca, p, recs)));
     ev.total_ms = ms(t0);
@@ -783,9 +793,17 @@ fn dumphash(archive: &str, pkg: &str) -> Result<()> {
     let members = ar::parse(&b)?;
     let o = &ar::member(&members, "_go_.o").context("no _go_.o")?.data;
     let obj = goobj::Obj::parse(o)?;
-    println!("defs {} hashed64 {} hashed {} nonpkgdef {} pkgs {:?}", obj.n_def, obj.n_h64, obj.n_hashed, obj.n_nonpkgdef, obj.pkg_index(o));
-    for esc in [true, false] {
-        let mut h = goobj::Hasher::new(&obj, o, pkg, esc);
+    println!(
+        "defs {} hashed64 {} hashed {} nonpkgdef {} pkgs {:?}",
+        obj.n_def,
+        obj.n_h64,
+        obj.n_hashed,
+        obj.n_nonpkgdef,
+        obj.pkg_index(o)
+    );
+    for spelling in [goobj::SelfPath::Escaped, goobj::SelfPath::Raw] {
+        let esc = spelling == goobj::SelfPath::Escaped;
+        let mut h = goobj::Hasher::new(&obj, o, pkg, spelling);
         let mut bad = 0;
         for j in 0..obj.n_hashed {
             let ok = h.hash(j, 0)? == h.stored(j);
@@ -802,23 +820,42 @@ fn dumphash(archive: &str, pkg: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn watch_cmd(args: &[String]) -> Result<ExitCode> {
+    watch::run(watch::parse_options(args)?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn watch_cmd(_: &[String]) -> Result<ExitCode> {
+    anyhow::bail!("gocut watch needs Linux (inotify and signalfd)")
+}
+
+// Bytes in GiB, for display.
+#[expect(clippy::cast_precision_loss, reason = "display only; two decimals of a GiB count")]
+fn gib(n: u64) -> f64 {
+    n as f64 / (1u64 << 30) as f64
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let r = match args.first().map(|s| s.as_str()) {
-        Some("stats") => store::stats(args.get(1).map(|s| s.as_str())).map(|_| ExitCode::SUCCESS),
+    let r = match args.first().map(String::as_str) {
+        Some("stats") => store::stats(args.get(1).map(String::as_str)).map(|()| ExitCode::SUCCESS),
         Some("gc") if args.get(1).is_some_and(|a| a == "--auto") => Store::open().map(|s| {
             s.auto_gc();
             ExitCode::SUCCESS
         }),
         Some("gc") => Store::open().and_then(|s| s.gc()).map(|(a, b)| {
-            println!("store: {:.2} GiB -> {:.2} GiB", a as f64 / (1u64 << 30) as f64, b as f64 / (1u64 << 30) as f64);
+            println!("store: {:.2} GiB -> {:.2} GiB", gib(a), gib(b));
             ExitCode::SUCCESS
         }),
-        Some("clear-log") => Store::open().and_then(|s| s.clear_log()).map(|_| ExitCode::SUCCESS),
-        Some("dumphash") if args.len() == 3 => dumphash(&args[1], &args[2]).map(|_| ExitCode::SUCCESS),
-        Some(t) if t.contains('/') => toolexec(args[0].clone(), args[1..].to_vec()),
+        Some("clear-log") => Store::open().and_then(|s| s.clear_log()).map(|()| ExitCode::SUCCESS),
+        Some("dumphash") if args.len() == 3 => dumphash(&args[1], &args[2]).map(|()| ExitCode::SUCCESS),
+        Some("watch") => watch_cmd(&args[1..]),
+        Some(t) if t.contains('/') => toolexec(t, &args[1..]),
         _ => {
-            eprintln!("usage: go build -toolexec=gocut ... | gocut stats [since-seconds] | gocut clear-log");
+            eprintln!(
+                "usage: go build -toolexec=gocut ... | gocut stats [since-seconds] | gocut clear-log | gocut watch ..."
+            );
             Ok(ExitCode::from(2))
         }
     };

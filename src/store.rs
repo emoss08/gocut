@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::usage::Roots;
 
 #[derive(Serialize, Deserialize)]
-pub struct Record {
+pub(crate) struct Record {
     pub pkg: String,
     pub buildid: String,
     pub out: String,
@@ -19,27 +19,35 @@ pub struct Record {
     pub roots: Roots,
 }
 
-pub type LsymTable = Vec<(String, String, Vec<i64>)>;
+pub(crate) type LsymTable = Vec<(String, String, Vec<i64>)>;
 
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
+// Lengths are stored as u32; a longer string or table is refused rather than written truncated.
+fn put_len(out: &mut Vec<u8>, n: usize) -> Result<()> {
+    out.extend_from_slice(&u32::try_from(n).context("symbol table entry longer than u32")?.to_le_bytes());
+    Ok(())
 }
 
-fn encode_lsyms(t: &LsymTable) -> Vec<u8> {
+fn put_str(out: &mut Vec<u8>, s: &str) -> Result<()> {
+    put_len(out, s.len())?;
+    out.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+fn encode_lsyms(t: &LsymTable) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(t.len() as u32).to_le_bytes());
+    put_len(&mut out, t.len())?;
     for (p, n, v) in t {
-        put_str(&mut out, p);
-        put_str(&mut out, n);
-        out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        put_str(&mut out, p)?;
+        put_str(&mut out, n)?;
+        put_len(&mut out, v.len())?;
         for x in v {
             out.extend_from_slice(&x.to_le_bytes());
         }
     }
-    out
+    Ok(out)
 }
 
+#[expect(clippy::many_single_char_names, reason = "byte-level decoder; short names follow the encoding")]
 fn decode_lsyms(b: &[u8]) -> Option<LsymTable> {
     let mut i = 0usize;
     let u32_at = |i: &mut usize| -> Option<u32> {
@@ -69,7 +77,7 @@ fn decode_lsyms(b: &[u8]) -> Option<LsymTable> {
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct Event {
+pub(crate) struct Event {
     pub ts: f64,
     pub pkg: String,
     pub decision: String,
@@ -97,33 +105,33 @@ thread_local! {
 }
 
 /// Runs `f`, adding its wall time in milliseconds to phase `name` of the current event.
-pub fn timed<T>(name: &str, f: impl FnOnce() -> T) -> T {
+pub(crate) fn timed<T>(name: &str, f: impl FnOnce() -> T) -> T {
     let t = std::time::Instant::now();
     let r = f();
     add_phase(name, t.elapsed().as_secs_f64() * 1000.0);
     r
 }
 
-pub fn add_phase(name: &str, ms: f64) {
+pub(crate) fn add_phase(name: &str, ms: f64) {
     PHASES.with(|p| *p.borrow_mut().entry(name.to_string()).or_default() += ms);
 }
 
-pub fn take_phases() -> BTreeMap<String, f64> {
+pub(crate) fn take_phases() -> BTreeMap<String, f64> {
     PHASES.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
 impl Event {
-    pub fn new(pkg: &str) -> Event {
-        let ts = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    pub(crate) fn new(pkg: &str) -> Event {
+        let ts = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
         Event { ts, pkg: pkg.to_string(), ..Default::default() }
     }
 }
 
-pub fn env_or<T: FromStr>(k: &str, default: T) -> T {
+pub(crate) fn env_or<T: FromStr>(k: &str, default: T) -> T {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-pub fn max_records() -> usize {
+pub(crate) fn max_records() -> usize {
     env_or("GOCUT_RECORDS", 4usize).max(1)
 }
 
@@ -146,7 +154,8 @@ fn age(p: &Path) -> Option<Duration> {
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().context("no parent")?;
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), path.file_name().unwrap().to_string_lossy()));
+    let name = path.file_name().context("no file name")?.to_string_lossy();
+    let tmp = dir.join(format!(".tmp-{}-{name}", std::process::id()));
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -262,21 +271,20 @@ fn delete_unreferenced(files: Vec<Entry>, rec_dir: &Path, live: &HashSet<String>
     now
 }
 
-pub struct Store {
+pub(crate) struct Store {
     pub dir: PathBuf,
 }
 
 impl Store {
-    pub fn open() -> Result<Store> {
-        let dir = match std::env::var_os("GOCUT_DIR") {
-            Some(d) => PathBuf::from(d),
-            None => {
-                let base = std::env::var_os("XDG_CACHE_HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-                    .context("no HOME")?;
-                base.join("gocut")
-            }
+    pub(crate) fn open() -> Result<Store> {
+        let dir = if let Some(d) = std::env::var_os("GOCUT_DIR") {
+            PathBuf::from(d)
+        } else {
+            let base = std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+                .context("no HOME")?;
+            base.join("gocut")
         };
         std::fs::create_dir_all(&dir)?;
         Ok(Store { dir })
@@ -312,14 +320,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn read_records(&self, key: &str) -> Vec<Record> {
+    pub(crate) fn read_records(&self, key: &str) -> Vec<Record> {
         let p = self.shard("rec", key, "json");
         let Ok(b) = std::fs::read(&p) else { return Vec::new() };
         touch(&p);
         parse_records(&b)
     }
 
-    pub fn write_record(&self, key: &str, r: &Record, old: &[Record]) -> Result<()> {
+    pub(crate) fn write_record(&self, key: &str, r: &Record, old: &[Record]) -> Result<()> {
         let kept = old.iter().filter(|o| o.deps != r.deps && o.out.len() >= 2 && self.blob_path(&o.out).exists());
         let recs: Vec<&Record> = std::iter::once(r).chain(kept).take(max_records()).collect();
         let data = serde_json::to_vec(&recs)?;
@@ -332,13 +340,13 @@ impl Store {
         self.shard("out", h, "a.zst")
     }
 
-    pub fn write_blob(&self, data: &[u8]) -> Result<String> {
+    pub(crate) fn write_blob(&self, data: &[u8]) -> Result<String> {
         let h = blake3::hash(data).to_hex().to_string();
         self.write_once(&self.blob_path(&h), || Ok(zstd::bulk::compress(data, 1)?))?;
         Ok(h)
     }
 
-    pub fn read_blob(&self, h: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read_blob(&self, h: &str) -> Result<Vec<u8>> {
         anyhow::ensure!(h.len() >= 2, "saved output hash is malformed");
         let out = read_zst(&self.blob_path(h), "output")?;
         anyhow::ensure!(blake3::hash(&out).to_hex().as_str() == h, "saved output is corrupt");
@@ -349,20 +357,20 @@ impl Store {
         self.shard("ex", fp, "bits.zst")
     }
 
-    pub fn has_export(&self, fp: &str) -> bool {
+    pub(crate) fn has_export(&self, fp: &str) -> bool {
         self.export_path(fp).exists()
     }
 
-    pub fn write_export(&self, fp: &str, bits: &[u8]) -> Result<()> {
+    pub(crate) fn write_export(&self, fp: &str, bits: &[u8]) -> Result<()> {
         self.write_once(&self.export_path(fp), || Ok(zstd::bulk::compress(bits, 1)?))
     }
 
-    pub fn read_export(&self, fp: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read_export(&self, fp: &str) -> Result<Vec<u8>> {
         read_zst(&self.export_path(fp), "export data")
     }
 
     // <fp>.hash holds appended "name\thash\n" lines; later lines win and an unterminated tail is ignored.
-    pub fn read_hashes(&self, fp: &str) -> HashMap<String, String> {
+    pub(crate) fn read_hashes(&self, fp: &str) -> HashMap<String, String> {
         let s = std::fs::read_to_string(self.shard("ex", fp, "hash")).unwrap_or_default();
         let complete = s.rfind('\n').map_or("", |i| &s[..i]);
         complete
@@ -373,7 +381,7 @@ impl Store {
             .collect()
     }
 
-    pub fn append_hashes(&self, fp: &str, add: &[(String, String)]) -> Result<()> {
+    pub(crate) fn append_hashes(&self, fp: &str, add: &[(String, String)]) -> Result<()> {
         if add.is_empty() {
             return Ok(());
         }
@@ -393,14 +401,14 @@ impl Store {
 
     // <fp>.same names the fingerprint whose export data hashes exactly like <fp>'s (positions and
     // symbol indices aside). Name hashes and package facts are then kept under that fingerprint.
-    pub fn canonical(&self, fp: &str) -> String {
+    pub(crate) fn canonical(&self, fp: &str) -> String {
         match std::fs::read_to_string(self.shard("ex", fp, "same")) {
             Ok(c) if c.len() == fp.len() && c.bytes().all(|b| b.is_ascii_hexdigit()) => c,
             _ => fp.to_string(),
         }
     }
 
-    pub fn link_same(&self, fp: &str, canonical: &str) -> Result<()> {
+    pub(crate) fn link_same(&self, fp: &str, canonical: &str) -> Result<()> {
         if fp != canonical {
             self.write_once(&self.shard("ex", fp, "same"), || Ok(canonical.as_bytes().to_vec()))?;
         }
@@ -408,31 +416,31 @@ impl Store {
     }
 
     // <fp>.pkg: "name\tinit\tpkghash", the facts the identity and import-graph checks compare.
-    pub fn read_pkg_facts(&self, fp: &str) -> Option<(String, bool, String)> {
+    pub(crate) fn read_pkg_facts(&self, fp: &str) -> Option<(String, bool, String)> {
         let s = std::fs::read_to_string(self.shard("ex", fp, "pkg")).ok()?;
         let mut it = s.split('\t');
         let (n, i, h) = (it.next()?, it.next()?, it.next()?);
         (h.len() == 64 && it.next().is_none()).then(|| (n.to_string(), i == "1", h.to_string()))
     }
 
-    pub fn write_pkg_facts(&self, fp: &str, f: &(String, bool, String)) -> Result<()> {
+    pub(crate) fn write_pkg_facts(&self, fp: &str, f: &(String, bool, String)) -> Result<()> {
         let s = format!("{}\t{}\t{}", f.0, if f.1 { "1" } else { "0" }, f.2);
         self.write_once(&self.shard("ex", fp, "pkg"), || Ok(s.into_bytes()))
     }
 
-    pub fn has_lsyms(&self, fp: &str) -> bool {
+    pub(crate) fn has_lsyms(&self, fp: &str) -> bool {
         self.shard("ex", fp, "lsym").exists()
     }
 
-    pub fn read_lsyms(&self, fp: &str) -> Option<LsymTable> {
+    pub(crate) fn read_lsyms(&self, fp: &str) -> Option<LsymTable> {
         decode_lsyms(&std::fs::read(self.shard("ex", fp, "lsym")).ok()?)
     }
 
-    pub fn write_lsyms(&self, fp: &str, t: &LsymTable) -> Result<()> {
-        self.write_once(&self.shard("ex", fp, "lsym"), || Ok(encode_lsyms(t)))
+    pub(crate) fn write_lsyms(&self, fp: &str, t: &LsymTable) -> Result<()> {
+        self.write_once(&self.shard("ex", fp, "lsym"), || encode_lsyms(t))
     }
 
-    pub fn save_mismatch(&self, pkg: &str, patched: &[u8], real: &[u8]) {
+    pub(crate) fn save_mismatch(&self, pkg: &str, patched: &[u8], real: &[u8]) {
         let safe = pkg.replace('/', "_");
         let d = self.dir.join("mismatch");
         let _ = std::fs::create_dir_all(&d);
@@ -441,25 +449,30 @@ impl Store {
         self.note_written(patched.len() + real.len());
     }
 
-    pub fn log(&self, ev: &Event) {
+    pub(crate) fn log(&self, ev: &Event) {
         let Ok(mut line) = serde_json::to_string(ev) else { return };
         line.push('\n');
         let _ = append(&self.log_path(), line.as_bytes());
     }
 
-    pub fn clear_log(&self) -> Result<()> {
-        let _ = std::fs::remove_file(self.log_path());
-        Ok(())
+    // A missing log is already clear; any other failure (permissions, say) is reported.
+    pub(crate) fn clear_log(&self) -> Result<()> {
+        match std::fs::remove_file(self.log_path()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", self.log_path().display()))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn rotate_log(&self) {
         let log = self.log_path();
-        if std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > 64 << 20 {
+        if std::fs::metadata(&log).map_or(0, |m| m.len()) > 64 << 20 {
             let _ = std::fs::rename(&log, self.dir.join("events.old.jsonl"));
         }
     }
 
-    pub fn budget(&self) -> u64 {
+    pub(crate) fn budget() -> u64 {
         env_or("GOCUT_MAX_BYTES", 4u64 << 30)
     }
 
@@ -467,7 +480,7 @@ impl Store {
         age(&self.dir.join("gc.stamp")).is_some_and(|a| a.as_secs() < 20)
     }
 
-    pub fn maybe_evict(&self) {
+    pub(crate) fn maybe_evict(&self) {
         if self.gc_recent() {
             return;
         }
@@ -480,7 +493,7 @@ impl Store {
             .spawn();
     }
 
-    pub fn auto_gc(&self) {
+    pub(crate) fn auto_gc(&self) {
         if self.gc_recent() {
             return;
         }
@@ -509,10 +522,10 @@ impl Store {
             .lines()
             .filter_map(|l| l.parse::<u64>().ok())
             .sum();
-        last.saturating_add(added) < self.budget()
+        last.saturating_add(added) < Store::budget()
     }
 
-    pub fn gc(&self) -> Result<(u64, u64)> {
+    pub(crate) fn gc(&self) -> Result<(u64, u64)> {
         self.rotate_log();
         self.walk()
     }
@@ -536,7 +549,7 @@ impl Store {
     fn evict(&self) -> Result<(u64, u64)> {
         let files = self.inventory();
         let total: u64 = files.iter().map(|f| f.len).sum();
-        let budget = self.budget();
+        let budget = Store::budget();
         if total <= budget {
             return Ok((total, total));
         }
@@ -548,11 +561,17 @@ impl Store {
     }
 }
 
-pub fn stats(since: Option<&str>) -> Result<()> {
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "display arithmetic: counts become f64 for averages, and a quantile in [0, 1] picks an index"
+)]
+pub(crate) fn stats(since: Option<&str>) -> Result<()> {
     let st = Store::open()?;
     let data = std::fs::read_to_string(st.log_path()).unwrap_or_default();
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs_f64();
-    let cutoff = since.and_then(|s| s.parse::<f64>().ok()).map(|s| now - s).unwrap_or(0.0);
+    let cutoff = since.and_then(|s| s.parse::<f64>().ok()).map_or(0.0, |s| now - s);
     let mut by: BTreeMap<String, (usize, f64)> = BTreeMap::new();
     let mut shadow: BTreeMap<String, usize> = BTreeMap::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
@@ -631,8 +650,7 @@ pub fn stats(since: Option<&str>) -> Result<()> {
         );
         let mut ps: Vec<_> = phase_sum.into_iter().collect();
         ps.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let line: Vec<String> =
-            ps.iter().map(|(k, v)| format!("{k} {:.1}", v / reuse_cost.len() as f64)).collect();
+        let line: Vec<String> = ps.iter().map(|(k, v)| format!("{k} {:.1}", v / reuse_cost.len() as f64)).collect();
         println!("  mean ms by phase: {}", line.join(", "));
     }
     Ok(())

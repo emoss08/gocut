@@ -6,13 +6,13 @@ use std::fmt;
 use anyhow::{Context, Result, ensure};
 
 use crate::ar;
-use crate::export::{self, Export};
-use crate::goobj::{HASH_SIZE, Hasher, Obj, SYMREF_SIZE, SymRef};
+use crate::export::{self, Export, Inliner};
+use crate::goobj::{HASH_SIZE, Hasher, Obj, SYMREF_SIZE, SelfPath, SymRef};
 use crate::pkgbits::{self, Section};
 use crate::store::{LsymTable, timed};
 
 #[derive(Debug)]
-pub struct Guard(pub String);
+pub(crate) struct Guard(pub String);
 
 impl fmt::Display for Guard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -22,20 +22,23 @@ impl fmt::Display for Guard {
 
 impl std::error::Error for Guard {}
 
-pub struct ChangedDep<'a> {
+pub(crate) struct ChangedDep<'a> {
     /// None when the caller knows this package copies nothing from the dependency and the new
-    /// export data hashes like the old (see patch_pkgdef and the full-DWARF guard).
+    /// export data hashes like the old (see `patch_pkgdef` and the full-DWARF guard).
     pub old: Option<&'a Export<'a>>,
     pub new: &'a Export<'a>,
     pub old_lsyms: &'a LsymTable,
     pub new_lsyms: &'a LsymTable,
 }
 
-pub fn lsym_table(ex: &Export) -> LsymTable {
+pub(crate) fn lsym_table(ex: &Export<'_>) -> LsymTable {
     ex.idents
         .iter()
         .enumerate()
-        .filter_map(|(i, id)| ex.lsyms(i as u32).ok().map(|v| (id.path.clone(), id.name.clone(), v)))
+        .filter_map(|(i, id)| {
+            let v = ex.lsyms(u32::try_from(i).ok()?).ok()?;
+            Some((id.path.clone(), id.name.clone(), v))
+        })
         .collect()
 }
 
@@ -144,8 +147,8 @@ struct PkgdefPatch {
 
 // The rewritten export data hashes like the old one if every replaced element masks to the same bytes
 // when parsed in its new context. Relocs, strings, names and Meta are never replaced.
-fn masks_equal(old: &Export, new_bits: &[u8], self_path: &str, new_inliner: bool, abs: &[usize]) -> bool {
-    let Ok(new) = Export::parse(new_bits, self_path, new_inliner) else { return false };
+fn masks_equal(old: &Export<'_>, new_bits: &[u8], self_path: &str, inliner: Inliner, abs: &[usize]) -> bool {
+    let Ok(new) = Export::parse(new_bits, self_path, inliner) else { return false };
     abs.iter().all(|&a| {
         let Some((k, idx)) = old.pb.section_of(a) else { return false };
         matches!(k, Section::Obj | Section::ObjExt | Section::Type | Section::PosBase)
@@ -153,9 +156,9 @@ fn masks_equal(old: &Export, new_bits: &[u8], self_path: &str, new_inliner: bool
     })
 }
 
-fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Result<PkgdefPatch> {
+fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep<'_>]) -> Result<PkgdefPatch> {
     let loc = export::locate(pkgdef)?;
-    let ex = timed("p_self_parse", || Export::parse(&pkgdef[loc.bits_start..loc.bits_end], self_path, loc.new_inliner))?;
+    let ex = timed("p_self_parse", || Export::parse(&pkgdef[loc.bits_start..loc.bits_end], self_path, loc.inliner))?;
     let old_fp = ex.pb.fingerprint;
     let tw = std::time::Instant::now();
     let mut seen: Vec<FxHashSet<(Section, u32, u32, u32)>> = vec![FxHashSet::default(); changed.len()];
@@ -188,8 +191,12 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Resul
             .new
             .find(&id.path, &id.name)
             .with_context(|| format!("copied {}.{} vanished from {}", id.path, id.name, old.self_path))?;
-        Walk { p: &ex, o: old, n: d.new, seen: &mut seen[di], decided: &mut decided, replaced: &mut replaced }
-            .run(Section::Obj, i as u32, io, inn)?;
+        Walk { p: &ex, o: old, n: d.new, seen: &mut seen[di], decided: &mut decided, replaced: &mut replaced }.run(
+            Section::Obj,
+            u32::try_from(i)?,
+            io,
+            inn,
+        )?;
     }
     crate::store::add_phase("p_walk", tw.elapsed().as_secs_f64() * 1000.0);
     if replaced.is_empty() {
@@ -197,13 +204,12 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Resul
     }
     let mut abs: Vec<usize> = replaced.keys().copied().collect();
     abs.sort_unstable();
-    let elems: Vec<Vec<u8>> = (0..ex.pb.elem_ends.len())
-        .map(|a| replaced.remove(&a).unwrap_or_else(|| ex.pb.raw_abs(a).to_vec()))
-        .collect();
-    let nb = pkgbits::dump(ex.pb.version, ex.pb.flags, &ex.pb.ends_ends, &elems);
+    let elems: Vec<Vec<u8>> =
+        (0..ex.pb.elem_ends.len()).map(|a| replaced.remove(&a).unwrap_or_else(|| ex.pb.raw_abs(a).to_vec())).collect();
+    let nb = pkgbits::dump(ex.pb.version, ex.pb.flags, &ex.pb.ends_ends, &elems)?;
     let mut new_fp = [0u8; 8];
     new_fp.copy_from_slice(&nb[nb.len() - 8..]);
-    let equivalent = timed("p_equiv", || masks_equal(&ex, &nb, self_path, loc.new_inliner, &abs));
+    let equivalent = timed("p_equiv", || masks_equal(&ex, &nb, self_path, loc.inliner, &abs));
     let tail = &pkgdef[loc.bits_end..];
     let mut out = Vec::with_capacity(loc.bits_start + nb.len() + tail.len());
     out.extend_from_slice(&pkgdef[..loc.bits_start]);
@@ -212,7 +218,7 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Resul
     Ok(PkgdefPatch { bytes: Some(out), old_fp, new_fp, equivalent })
 }
 
-fn moved_types<'n>(d: &ChangedDep, want: &HashSet<&'n str>) -> Result<HashSet<&'n str>> {
+fn moved_types<'n>(d: &ChangedDep<'_>, want: &HashSet<&'n str>) -> Result<HashSet<&'n str>> {
     let mut types = HashSet::new();
     let old = d.old.context("old export data not loaded")?;
     for (oi, id) in old.idents.iter().enumerate() {
@@ -221,10 +227,11 @@ fn moved_types<'n>(d: &ChangedDep, want: &HashSet<&'n str>) -> Result<HashSet<&'
         }
         let Some(&name) = want.get(id.name.as_str()) else { continue };
         let Some(ni) = d.new.find(&id.path, &id.name) else { continue };
-        if old.pb.raw(Section::Obj, oi as u32)? == d.new.pb.raw(Section::Obj, ni)? {
+        let oi = u32::try_from(oi)?;
+        if old.pb.raw(Section::Obj, oi)? == d.new.pb.raw(Section::Obj, ni)? {
             continue;
         }
-        let os = old.pos_slots(Section::Obj, oi as u32)?;
+        let os = old.pos_slots(Section::Obj, oi)?;
         let ns = d.new.pos_slots(Section::Obj, ni)?;
         if os.len() != ns.len() || os.iter().zip(&ns).any(|(a, b)| (a.line, a.col) != (b.line, b.col)) {
             types.insert(name);
@@ -237,11 +244,10 @@ fn guard_moved_methods(
     b: &[u8],
     sites: &[usize],
     pkgs: &[String],
-    changed: &[ChangedDep],
-    maps: &IndexMaps,
+    changed: &[ChangedDep<'_>],
+    maps: &IndexMaps<'_>,
 ) -> Result<()> {
-    let dep_of: Vec<Option<usize>> =
-        pkgs.iter().map(|p| changed.iter().position(|d| d.new.self_path == *p)).collect();
+    let dep_of: Vec<Option<usize>> = pkgs.iter().map(|p| changed.iter().position(|d| d.new.self_path == *p)).collect();
     let mut calls = Vec::new();
     for &site in sites {
         let r = Obj::symref_at(b, site);
@@ -249,10 +255,11 @@ fn guard_moved_methods(
             continue;
         }
         let Some(&Some(di)) = dep_of.get(r.pkg as usize) else { continue };
-        if let Some(&(name, slot)) = maps.old_to_ident.get(&(pkgs[r.pkg as usize].as_str(), r.idx as i64))
-            && slot >= 2 {
-                calls.push((di, name));
-            }
+        if let Some(&(name, slot)) = maps.old_to_ident.get(&(pkgs[r.pkg as usize].as_str(), i64::from(r.idx)))
+            && slot >= 2
+        {
+            calls.push((di, name));
+        }
     }
     if calls.is_empty() {
         return Ok(());
@@ -275,7 +282,7 @@ fn guard_moved_methods(
     }
 }
 
-fn remap_symrefs(b: &[u8], sites: &[usize], pkgs: &[String], maps: &IndexMaps) -> Result<Vec<(usize, SymRef)>> {
+fn remap_symrefs(b: &[u8], sites: &[usize], pkgs: &[String], maps: &IndexMaps<'_>) -> Result<Vec<(usize, SymRef)>> {
     let mut out = Vec::new();
     if maps.moved_paths.is_empty() {
         return Ok(out);
@@ -293,13 +300,14 @@ fn remap_symrefs(b: &[u8], sites: &[usize], pkgs: &[String], maps: &IndexMaps) -
         let path = pkgs[pi].as_str();
         let &(name, slot) = maps
             .old_to_ident
-            .get(&(path, r.idx as i64))
+            .get(&(path, i64::from(r.idx)))
             .with_context(|| format!("cannot name old symbol {path}:{}", r.idx))?;
         let vals = maps.new_vals.get(&(path, name)).with_context(|| format!("{path}.{name} vanished"))?;
         let v = *vals.get(slot).context("slot vanished")?;
         ensure!(v >= 0, "{path}.{name} is no longer indexed");
-        if v as u32 != r.idx {
-            out.push((site, SymRef { pkg: r.pkg, idx: v as u32 }));
+        let v = u32::try_from(v).with_context(|| format!("{path}.{name} index {v} out of range"))?;
+        if v != r.idx {
+            out.push((site, SymRef { pkg: r.pkg, idx: v }));
         }
     }
     Ok(out)
@@ -355,7 +363,7 @@ fn affected_hashed(obj: &Obj, b: &[u8], remaps: &[(usize, SymRef)]) -> Option<(V
 
 fn reproduce_hashes(obj: &Obj, b: &[u8], self_path: &str, remaps: &[(usize, SymRef)]) -> Result<Option<Rehash>> {
     let Some((affected, children)) = affected_hashed(obj, b, remaps) else { return Ok(None) };
-    let mut h = Hasher::new(obj, b, self_path, true);
+    let mut h = Hasher::new(obj, b, self_path, SelfPath::Escaped);
     for j in 0..obj.n_hashed {
         h.over[j] = Some(h.stored(j));
     }
@@ -371,7 +379,7 @@ fn reproduce_hashes(obj: &Obj, b: &[u8], self_path: &str, remaps: &[(usize, SymR
 fn rehash(obj: &Obj, b: &mut [u8], self_path: &str, plan: &Rehash) -> Result<()> {
     let mut writes = Vec::new();
     {
-        let mut h = Hasher::new(obj, b, self_path, true);
+        let mut h = Hasher::new(obj, b, self_path, SelfPath::Escaped);
         let mut remaining = 0;
         for j in 0..obj.n_hashed {
             if plan.affected[j] {
@@ -421,14 +429,14 @@ fn rewrite_build_id(members: &mut [ar::Member], old_buildid: &str, new_buildid: 
     Ok(())
 }
 
-pub struct Patched {
+pub(crate) struct Patched {
     pub bytes: Vec<u8>,
     pub remapped_refs: usize,
     /// Old and new export data fingerprints, when the new export data hashes exactly like the old.
     pub equivalent: Option<([u8; 8], [u8; 8])>,
 }
 
-pub struct Target<'a> {
+pub(crate) struct Target<'a> {
     pub old_archive: &'a [u8],
     pub self_path: &'a str,
     pub old_buildid: &'a str,
@@ -436,7 +444,7 @@ pub struct Target<'a> {
     pub full_dwarf: bool,
 }
 
-pub fn patch(t: &Target, changed: &[ChangedDep], new_fps: &HashMap<String, [u8; 8]>) -> Result<Patched> {
+pub(crate) fn patch(t: &Target<'_>, changed: &[ChangedDep<'_>], new_fps: &HashMap<String, [u8; 8]>) -> Result<Patched> {
     let Target { old_archive, self_path, old_buildid, new_buildid, full_dwarf } = *t;
     let mut members = timed("p_ar", || ar::parse(old_archive))?;
     let maps = timed("p_index_maps", || index_maps(changed))?;

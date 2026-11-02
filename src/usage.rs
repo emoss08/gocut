@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
-pub struct Import {
+pub(crate) struct Import {
     pub name: Option<String>,
     pub path: String,
 }
 
 #[derive(Default, Debug)]
-pub struct FileUse {
+pub(crate) struct FileUse {
     pub imports: Vec<Import>,
     pub selectors: BTreeSet<(String, String)>,
 }
@@ -139,7 +139,7 @@ fn import_spec(toks: &[Tok], i: &mut usize, imports: &mut Vec<Import>) {
     }
 }
 
-pub fn scan(src: &[u8]) -> FileUse {
+pub(crate) fn scan(src: &[u8]) -> FileUse {
     let toks = lex(src);
     let mut fu = FileUse::default();
     let mut i = 0;
@@ -194,12 +194,12 @@ pub fn scan(src: &[u8]) -> FileUse {
 }
 
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Roots {
+pub(crate) struct Roots {
     pub names: BTreeMap<String, BTreeSet<String>>,
     pub all: BTreeSet<String>,
 }
 
-pub fn roots(files: &[FileUse], pkg_name: &dyn Fn(&str) -> Option<String>) -> Roots {
+pub(crate) fn roots(files: &[FileUse], pkg_name: &dyn Fn(&str) -> Option<String>) -> Roots {
     let mut r = Roots::default();
     for f in files {
         for Import { name, path } in &f.imports {
@@ -213,13 +213,13 @@ pub fn roots(files: &[FileUse], pkg_name: &dyn Fn(&str) -> Option<String>) -> Ro
                     continue;
                 }
                 Some(n) => n.to_string(),
-                None => match pkg_name(path) {
-                    Some(n) => n,
-                    None => {
+                None => {
+                    let Some(n) = pkg_name(path) else {
                         r.all.insert(path.clone());
                         continue;
-                    }
-                },
+                    };
+                    n
+                }
             };
             let set = r.names.entry(path.clone()).or_default();
             for (a, b) in &f.selectors {

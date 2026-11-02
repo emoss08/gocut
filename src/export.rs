@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::pkgbits::{self, Elem, PkgBits, Rd, Reloc, Section};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tag {
+pub(crate) enum Tag {
     Alias,
     Const,
     Type,
@@ -33,21 +33,21 @@ impl Tag {
 }
 
 #[derive(Clone, Debug)]
-pub struct ObjIdent {
+pub(crate) struct ObjIdent {
     pub path: String,
     pub name: String,
     pub tag: Tag,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Slot {
+pub(crate) struct Slot {
     pub start: usize,
     pub end: usize,
     pub value: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PosSlot {
+pub(crate) struct PosSlot {
     pub start: usize,
     pub end: usize,
     pub line: u64,
@@ -105,14 +105,14 @@ fn tagged(prefix: &[u8], raw: &[u8]) -> Vec<u8> {
     [prefix, raw].concat()
 }
 
-fn slot(rd: &mut Rd, slots: &mut Vec<Slot>) -> Result<i64> {
+fn slot(rd: &mut Rd<'_>, slots: &mut Vec<Slot>) -> Result<i64> {
     let start = rd.pos;
     let value = rd.varint()?;
     slots.push(Slot { start, end: rd.pos, value });
     Ok(value)
 }
 
-fn lsym_slot(rd: &mut Rd, slots: &mut Vec<Slot>) -> Result<()> {
+fn lsym_slot(rd: &mut Rd<'_>, slots: &mut Vec<Slot>) -> Result<()> {
     if slot(rd, slots)? < 0 {
         rd.skip_uvarint()?;
         rd.boolean()?;
@@ -120,14 +120,14 @@ fn lsym_slot(rd: &mut Rd, slots: &mut Vec<Slot>) -> Result<()> {
     Ok(())
 }
 
-pub struct Export<'a> {
+pub(crate) struct Export<'a> {
     pub pb: PkgBits<'a>,
     pub self_path: String,
     pub self_name: String,
     pub has_init: bool,
     pub idents: Vec<ObjIdent>,
     self_pkg: u32,
-    new_inliner: bool,
+    inliner: Inliner,
     by_ident: FxHashMap<String, FxHashMap<String, u32>>,
     bodies: FxHashMap<u32, Vec<u32>>,
     objs: RefCell<FxHashMap<u32, Rc<ObjInfo>>>,
@@ -151,7 +151,7 @@ impl<'a, 'b> ER<'a, 'b> {
     }
 
     fn reloc(&mut self, want: Section) -> Result<u32> {
-        let i = self.rd.uvarint()? as usize;
+        let i = usize::try_from(self.rd.uvarint()?)?;
         let r = self.relocs.get(i).context("reloc index out of range")?;
         ensure!(r.kind == want, "reloc kind {:?}, want {want:?}", r.kind);
         Ok(r.idx)
@@ -183,11 +183,7 @@ impl<'a, 'b> ER<'a, 'b> {
 
     // Derived types are an index into the ObjDict's derived list, not a reloc.
     fn typ_info(&mut self) -> Result<()> {
-        if self.rd.boolean()? {
-            self.rd.skip_uvarint()
-        } else {
-            self.reloc(Section::Type).map(|_| ())
-        }
+        if self.rd.boolean()? { self.rd.skip_uvarint() } else { self.reloc(Section::Type).map(|_| ()) }
     }
 
     fn obj_info(&mut self) -> Result<()> {
@@ -307,7 +303,7 @@ impl<'a, 'b> ER<'a, 'b> {
     }
 
     fn params(&mut self) -> Result<usize> {
-        let n = self.rd.uvarint()? as usize;
+        let n = usize::try_from(self.rd.uvarint()?)?;
         for _ in 0..n {
             self.param()?;
         }
@@ -342,11 +338,11 @@ fn body_base(name: &str) -> &str {
     base.split('[').next().unwrap_or(base)
 }
 
-fn root_pkg(pb: &PkgBits) -> Result<u32> {
+fn root_pkg(pb: &PkgBits<'_>) -> Result<u32> {
     ER::new(pb, Section::Meta, 0)?.reloc(Section::Pkg)
 }
 
-fn path_name(pb: &PkgBits, self_path: &str, pkg_idx: u32) -> Result<(String, String)> {
+fn path_name(pb: &PkgBits<'_>, self_path: &str, pkg_idx: u32) -> Result<(String, String)> {
     let mut r = ER::new(pb, Section::Pkg, pkg_idx)?;
     let raw = r.string()?;
     let path = if raw.is_empty() { self_path.to_string() } else { utf8(raw) };
@@ -357,35 +353,34 @@ fn path_name(pb: &PkgBits, self_path: &str, pkg_idx: u32) -> Result<(String, Str
     Ok((path, name))
 }
 
-fn read_ident(pb: &PkgBits, self_path: &str, i: u32, paths: &mut HashMap<u32, String>) -> Result<ObjIdent> {
+fn read_ident(pb: &PkgBits<'_>, self_path: &str, i: u32, paths: &mut HashMap<u32, String>) -> Result<ObjIdent> {
     let mut r = ER::new(pb, Section::Name, i)?;
     let pkg = r.reloc(Section::Pkg)?;
     let name = utf8(r.string()?);
     let tag = Tag::from_u64(r.rd.uvarint()?)?;
-    let path = match paths.get(&pkg) {
-        Some(p) => p.clone(),
-        None => {
-            let p = path_name(pb, self_path, pkg)?.0;
-            paths.insert(pkg, p.clone());
-            p
-        }
+    let path = if let Some(p) = paths.get(&pkg) {
+        p.clone()
+    } else {
+        let p = path_name(pb, self_path, pkg)?.0;
+        paths.insert(pkg, p.clone());
+        p
     };
     Ok(ObjIdent { path, name, tag })
 }
 
-fn type_pos(mut r: ER, idx: u32) -> Result<Vec<PosSlot>> {
+fn type_pos(mut r: ER<'_, '_>, idx: u32) -> Result<Vec<PosSlot>> {
     r.do_typ()?;
     ensure!(r.rd.at_end(), "trailing bytes in Type element {idx}");
     Ok(r.slots)
 }
 
-pub fn pkg_name(bits: &[u8]) -> Result<String> {
+pub(crate) fn pkg_name(bits: &[u8]) -> Result<String> {
     let pb = PkgBits::parse(bits)?;
     Ok(path_name(&pb, "", root_pkg(&pb)?)?.1)
 }
 
 impl<'a> Export<'a> {
-    pub fn parse(bits: &'a [u8], self_path: &str, new_inliner: bool) -> Result<Export<'a>> {
+    pub(crate) fn parse(bits: &'a [u8], self_path: &str, inliner: Inliner) -> Result<Export<'a>> {
         let pb = PkgBits::parse(bits)?;
         let self_pkg = root_pkg(&pb)?;
         let self_name = path_name(&pb, self_path, self_pkg)?.1;
@@ -394,7 +389,7 @@ impl<'a> Export<'a> {
         let mut idents = Vec::with_capacity(n);
         let mut by_ident: FxHashMap<String, FxHashMap<String, u32>> = FxHashMap::default();
         let mut paths = HashMap::new();
-        for i in 0..n as u32 {
+        for i in 0..u32::try_from(n).context("too many objects")? {
             let id = read_ident(&pb, self_path, i, &mut paths)?;
             match by_ident.get_mut(&id.path) {
                 Some(names) => {
@@ -422,7 +417,7 @@ impl<'a> Export<'a> {
         if !by_base.is_empty() {
             for (i, id) in idents.iter().enumerate() {
                 if let Some(bs) = by_base.get(&id.path).and_then(|names| names.get(&id.name)) {
-                    bodies.insert(i as u32, bs.clone());
+                    bodies.insert(u32::try_from(i)?, bs.clone());
                 }
             }
         }
@@ -434,7 +429,7 @@ impl<'a> Export<'a> {
             has_init,
             idents,
             self_pkg,
-            new_inliner,
+            inliner,
             by_ident,
             bodies,
             objs: RefCell::default(),
@@ -444,10 +439,10 @@ impl<'a> Export<'a> {
 
     fn dict_counts(&self, i: u32) -> Result<(usize, usize, usize)> {
         let mut r = ER::new(&self.pb, Section::ObjDict, i)?;
-        let implicits = r.rd.uvarint()? as usize;
+        let implicits = usize::try_from(r.rd.uvarint()?)?;
         let receivers =
-            if self.pb.version >= pkgbits::VERSION_GENERIC_METHODS { r.rd.uvarint()? as usize } else { 0 };
-        let explicits = r.rd.uvarint()? as usize;
+            if self.pb.version >= pkgbits::VERSION_GENERIC_METHODS { usize::try_from(r.rd.uvarint()?)? } else { 0 };
+        let explicits = usize::try_from(r.rd.uvarint()?)?;
         Ok((implicits, receivers, explicits))
     }
 
@@ -497,7 +492,7 @@ impl<'a> Export<'a> {
                 r.pos()?;
                 r.type_param_names(explicits)?;
                 r.typ_info()?;
-                let nm = r.rd.uvarint()? as usize;
+                let nm = usize::try_from(r.rd.uvarint()?)?;
                 let mut methods = Vec::with_capacity(nm.min(1024));
                 for _ in 0..nm {
                     r.pos()?;
@@ -530,7 +525,7 @@ impl<'a> Export<'a> {
         Ok(o)
     }
 
-    pub fn pos_slots(&self, k: Section, idx: u32) -> Result<Vec<PosSlot>> {
+    pub(crate) fn pos_slots(&self, k: Section, idx: u32) -> Result<Vec<PosSlot>> {
         match k {
             Section::Obj => Ok(self.obj(idx)?.pos.clone()),
             Section::Type => type_pos(ER::new(&self.pb, k, idx)?, idx),
@@ -553,7 +548,7 @@ impl<'a> Export<'a> {
         }
     }
 
-    fn func_ext(&self, rd: &mut Rd, nparams: usize, slots: &mut Vec<Slot>) -> Result<()> {
+    fn func_ext(&self, rd: &mut Rd<'_>, nparams: usize, slots: &mut Vec<Slot>) -> Result<()> {
         rd.varint()?;
         lsym_slot(rd, slots)?;
         if rd.boolean()? {
@@ -564,7 +559,7 @@ impl<'a> Export<'a> {
             if rd.boolean()? {
                 rd.skip_uvarint()?;
                 rd.boolean()?;
-                if self.new_inliner {
+                if self.inliner == Inliner::New {
                     rd.skip_uvarint()?;
                 }
             }
@@ -574,7 +569,7 @@ impl<'a> Export<'a> {
         Ok(())
     }
 
-    pub fn ext_slots(&self, i: u32) -> Result<Vec<Slot>> {
+    pub(crate) fn ext_slots(&self, i: u32) -> Result<Vec<Slot>> {
         let e = self.pb.elem(Section::ObjExt, i)?;
         self.ext_slots_in(i, e.payload)
     }
@@ -603,7 +598,7 @@ impl<'a> Export<'a> {
         Ok(slots)
     }
 
-    pub fn lsyms(&self, i: u32) -> Result<Vec<i64>> {
+    pub(crate) fn lsyms(&self, i: u32) -> Result<Vec<i64>> {
         Ok(self.ext_slots(i)?.into_iter().map(|s| s.value).collect())
     }
 
@@ -629,7 +624,7 @@ impl<'a> Export<'a> {
         }
     }
 
-    pub fn masked_payload(&self, k: Section, idx: u32) -> Result<Vec<u8>> {
+    pub(crate) fn masked_payload(&self, k: Section, idx: u32) -> Result<Vec<u8>> {
         if k == Section::String {
             return Ok(self.pb.string(idx)?.to_vec());
         }
@@ -644,15 +639,15 @@ impl<'a> Export<'a> {
         let raw = r.string()?;
         let path: &[u8] = if raw.is_empty() { self.self_path.as_bytes() } else { raw };
         let mut out = Vec::with_capacity(path.len() + 32);
-        out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(path.len())?.to_le_bytes());
         out.extend_from_slice(path);
         if path == b"builtin" || path == b"unsafe" {
             return Ok(Node { payload: Payload::Owned(out), children: Vec::new() });
         }
         let name = r.string()?;
-        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(name.len())?.to_le_bytes());
         out.extend_from_slice(name);
-        let n = r.rd.uvarint()? as usize;
+        let n = usize::try_from(r.rd.uvarint()?)?;
         let mut children = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
             children.push((Section::Pkg as u8, Section::Pkg, r.reloc(Section::Pkg)?));
@@ -702,12 +697,12 @@ impl<'a> Export<'a> {
             h.update(&o.to_le_bytes());
             return Ok(None);
         }
-        let n = ord.len() as u32;
+        let n = u32::try_from(ord.len())?;
         ord.insert((k, idx), n);
         h.update(&[2, k as u8]);
         if k == Section::String {
             let s = self.pb.string(idx)?;
-            h.update(&(s.len() as u32).to_le_bytes());
+            h.update(&u32::try_from(s.len())?.to_le_bytes());
             h.update(s);
             return Ok(None);
         }
@@ -716,9 +711,9 @@ impl<'a> Export<'a> {
             Payload::Raw(skip) => &self.pb.raw(k, idx)?[*skip..],
             Payload::Owned(v) => v.as_slice(),
         };
-        h.update(&(payload.len() as u32).to_le_bytes());
+        h.update(&u32::try_from(payload.len())?.to_le_bytes());
         h.update(payload);
-        h.update(&(node.children.len() as u32).to_le_bytes());
+        h.update(&u32::try_from(node.children.len())?.to_le_bytes());
         Ok(Some(node))
     }
 
@@ -748,30 +743,38 @@ impl<'a> Export<'a> {
         Ok(*h.finalize().as_bytes())
     }
 
-    pub fn obj_hash(&self, root: u32) -> Result<[u8; 32]> {
+    pub(crate) fn obj_hash(&self, root: u32) -> Result<[u8; 32]> {
         self.closure_hash(Section::Obj, root)
     }
 
-    pub fn pkg_hash(&self) -> Result<[u8; 32]> {
+    pub(crate) fn pkg_hash(&self) -> Result<[u8; 32]> {
         self.closure_hash(Section::Pkg, self.self_pkg)
     }
 
-    pub fn new_inliner(&self) -> bool {
-        self.new_inliner
+    pub(crate) fn inliner(&self) -> Inliner {
+        self.inliner
     }
 
-    pub fn find(&self, path: &str, name: &str) -> Option<u32> {
+    pub(crate) fn find(&self, path: &str, name: &str) -> Option<u32> {
         self.by_ident.get(path)?.get(name).copied()
     }
 }
 
-pub struct ExportFile {
-    pub bits_start: usize,
-    pub bits_end: usize,
-    pub new_inliner: bool,
+// Which inliner wrote the export data. The new one (GOEXPERIMENT=newinliner, named in the header's
+// X: list) adds a field to every inlinable function body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Inliner {
+    Classic,
+    New,
 }
 
-pub fn locate(pkgdef: &[u8]) -> Result<ExportFile> {
+pub(crate) struct ExportFile {
+    pub bits_start: usize,
+    pub bits_end: usize,
+    pub inliner: Inliner,
+}
+
+pub(crate) fn locate(pkgdef: &[u8]) -> Result<ExportFile> {
     let marker = b"\n$$B\nu";
     let start = find_bytes(pkgdef, marker).context("no unified export data marker")? + marker.len();
     let tail = b"\n$$\n";
@@ -781,13 +784,17 @@ pub fn locate(pkgdef: &[u8]) -> Result<ExportFile> {
     let hs = String::from_utf8_lossy(&pkgdef[..header_end]);
     // Header is "go object GOOS GOARCH VERSION[ K=V] X:exp,exp"; wasm FuncExts carry three extra strings.
     let mut words = hs.split(' ');
-    ensure!(words.next() == Some("go") && words.next() == Some("object"), "export data header is not a go object header");
+    ensure!(
+        words.next() == Some("go") && words.next() == Some("object"),
+        "export data header is not a go object header"
+    );
     ensure!(words.nth(1) != Some("wasm"), "wasm export data is not supported");
-    let new_inliner = hs.rsplit_once(" X:").is_some_and(|(_, x)| x.trim_end().split(',').any(|e| e == "newinliner"));
-    Ok(ExportFile { bits_start: start, bits_end: end, new_inliner })
+    let new = hs.rsplit_once(" X:").is_some_and(|(_, x)| x.trim_end().split(',').any(|e| e == "newinliner"));
+    let inliner = if new { Inliner::New } else { Inliner::Classic };
+    Ok(ExportFile { bits_start: start, bits_end: end, inliner })
 }
 
-pub fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
@@ -826,13 +833,8 @@ mod tests {
         let mut cnst = Vec::new();
         pos(&mut cnst, line + 2, 7);
         cnst.extend_from_slice(&[0, 1, 1, 3, 2, 0, 2, 7]);
-        let field_relocs = [
-            (Section::PosBase, 0),
-            (Section::Pkg, 0),
-            (Section::String, 2),
-            (Section::Type, 0),
-            (Section::String, 0),
-        ];
+        let field_relocs =
+            [(Section::PosBase, 0), (Section::Pkg, 0), (Section::String, 2), (Section::Type, 0), (Section::String, 0)];
         let sections: [Vec<Vec<u8>>; NUM_SECTIONS] = [
             vec![b"".to_vec(), b"p".to_vec(), b"F".to_vec(), b"f.go".to_vec(), b"C".to_vec()],
             vec![el(&[(Section::Pkg, 0)], &[0]), el(&[], &[0, 0])],
@@ -854,41 +856,41 @@ mod tests {
         let mut ends = [0u32; NUM_SECTIONS];
         let mut sum = 0;
         for (e, s) in ends.iter_mut().zip(&sections) {
-            sum += s.len() as u32;
+            sum += u32::try_from(s.len()).unwrap();
             *e = sum;
         }
         let elems: Vec<Vec<u8>> = sections.into_iter().flatten().collect();
-        dump(pkgbits::VERSION_GENERIC_METHODS, 0, &ends, &elems)
+        dump(pkgbits::VERSION_GENERIC_METHODS, 0, &ends, &elems).unwrap()
     }
 
     #[test]
     fn type_positions() {
         let bits = build(300, 2);
-        let ex = Export::parse(&bits, PATH, false).unwrap();
+        let ex = Export::parse(&bits, PATH, Inliner::Classic).unwrap();
         assert_eq!(slot_tuples(ex.pos_slots(Section::Type, 1).unwrap()), vec![(4, 7, 300, 5)]);
-        assert!(ex.pos_slots(Section::Type, 0).unwrap().is_empty());
+        assert_eq!(slot_tuples(ex.pos_slots(Section::Type, 0).unwrap()), []);
         assert_eq!(ex.masked_payload(Section::Type, 1).unwrap(), vec![8, 1, 1, 0, POS_MASK, 1, 2, 0, 3, 4, 0]);
     }
 
     #[test]
     fn obj_positions() {
         let bits = build(300, 2);
-        let ex = Export::parse(&bits, PATH, false).unwrap();
+        let ex = Export::parse(&bits, PATH, Inliner::Classic).unwrap();
         let f = ex.find(PATH, "F").unwrap();
         let c = ex.find(PATH, "C").unwrap();
         assert_eq!(slot_tuples(ex.pos_slots(Section::Obj, f).unwrap()), vec![(2, 5, 301, 2)]);
         assert_eq!(slot_tuples(ex.pos_slots(Section::Obj, c).unwrap()), vec![(2, 5, 302, 7)]);
-        assert!(ex.pos_slots(Section::ObjDict, c).unwrap().is_empty());
-        assert!(ex.pos_slots(Section::PosBase, 0).unwrap().is_empty());
+        assert_eq!(slot_tuples(ex.pos_slots(Section::ObjDict, c).unwrap()), []);
+        assert_eq!(slot_tuples(ex.pos_slots(Section::PosBase, 0).unwrap()), []);
         assert!(ex.pos_slots(Section::Body, 0).is_err());
     }
 
     #[test]
     fn hash_ignores_positions() {
         let (a, b, c) = (build(300, 2), build(7, 2), build(300, 3));
-        let ea = Export::parse(&a, PATH, false).unwrap();
-        let eb = Export::parse(&b, PATH, false).unwrap();
-        let ec = Export::parse(&c, PATH, false).unwrap();
+        let ea = Export::parse(&a, PATH, Inliner::Classic).unwrap();
+        let eb = Export::parse(&b, PATH, Inliner::Classic).unwrap();
+        let ec = Export::parse(&c, PATH, Inliner::Classic).unwrap();
         for name in ["F", "C"] {
             let i = ea.find(PATH, name).unwrap();
             assert_eq!(ea.obj_hash(i).unwrap(), eb.obj_hash(i).unwrap(), "{name}");
@@ -900,8 +902,8 @@ mod tests {
     #[test]
     fn memo_keeps_hashes() {
         let bits = build(300, 2);
-        let a = Export::parse(&bits, PATH, false).unwrap();
-        let b = Export::parse(&bits, PATH, false).unwrap();
+        let a = Export::parse(&bits, PATH, Inliner::Classic).unwrap();
+        let b = Export::parse(&bits, PATH, Inliner::Classic).unwrap();
         let (f, c) = (a.find(PATH, "F").unwrap(), a.find(PATH, "C").unwrap());
         let (af, ac) = (a.obj_hash(f).unwrap(), a.obj_hash(c).unwrap());
         assert_eq!(b.obj_hash(c).unwrap(), ac);
@@ -915,7 +917,7 @@ mod tests {
     fn package_name() {
         let bits = build(300, 2);
         assert_eq!(pkg_name(&bits).unwrap(), "p");
-        assert_eq!(Export::parse(&bits, PATH, false).unwrap().self_name, "p");
-        assert_eq!(Export::parse(&bits, PATH, false).unwrap().find(PATH, "X"), None);
+        assert_eq!(Export::parse(&bits, PATH, Inliner::Classic).unwrap().self_name, "p");
+        assert_eq!(Export::parse(&bits, PATH, Inliner::Classic).unwrap().find(PATH, "X"), None);
     }
 }

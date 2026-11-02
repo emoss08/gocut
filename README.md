@@ -116,7 +116,8 @@ go build -toolexec=/path/to/gocut -o ./bin/app ./cmd/app
 gocut passes every tool other than `compile` straight through, along with version queries
 (`-V`).
 
-With [air](https://github.com/air-verse/air), put it in `build.cmd`:
+For a hot-reload loop, use `gocut watch` (below). With [air](https://github.com/air-verse/air),
+put it in `build.cmd`:
 
 ```toml
 [build]
@@ -126,6 +127,58 @@ cmd = "GOCUT_MODE=active go build -toolexec=/path/to/gocut -o ./tmp/main ./cmd/a
 Builds with `-toolexec` do not share the normal Go build cache, because cmd/go keys actions on
 the toolexec command. The first build after enabling gocut is a full build. It records every
 package it compiles, so reuse can start on the next build.
+
+### Hot reload: `gocut watch`
+
+`gocut watch` rebuilds a program when a file it is built from changes, and restarts it:
+
+```sh
+gocut watch --pkg ./cmd/app --bin ./tmp/app \
+  --build "GOCUT_MODE=active go build -toolexec=/path/to/gocut -o ./tmp/app ./cmd/app"
+```
+
+It replaces air for this loop, and differs from it in these ways:
+
+- **Builds never overlap.** A relevant change during a build interrupts that build (SIGINT to
+  its process group, SIGKILL after `--kill-delay`) before the next one starts. air leaves the
+  old `go build` running beside the new one, so rapid saves pile builds up.
+- **Nothing outlives the watcher.** The build and the server each run in their own process
+  group, which the watcher stops on SIGINT, SIGTERM or SIGHUP. If the watcher is killed
+  outright, its direct children get SIGKILL (`PR_SET_PDEATHSIG`). air stops only the server on
+  exit, so a build in progress keeps running.
+- **Only the binary's files count.** With `--pkg`, `go list -deps` gives the binary's packages
+  after each successful build, wherever they live: a `replace` to a sibling directory or a
+  `go.work` member is watched too. An edit to a package the binary does not import is logged and
+  ignored. Non-test `.go` files in those packages count, and so do their embedded, assembly, C
+  and syso files, new files beside embedded ones, and `go.mod`, `go.sum` and `go.work`.
+- **Config changes restart without a build.** A change under a `--restart` path, such as the
+  config file the server reads at startup, restarts the server with the binary it has. If a
+  build is due or running, that build restarts the server instead, even when its binary is
+  unchanged. After a failed build there is no current binary, so a config change does nothing
+  until a build succeeds.
+- **Unchanged saves and binaries are skipped.** A save that leaves a file's contents as they
+  were does not start a build, and a build whose binary is byte-identical to the running one
+  keeps the server running.
+
+A failed build stops the server. `--build` and `--run` (which defaults to `--bin`) run under
+`/bin/sh -c` in `--root`, and relative `--bin` and `--restart` paths are resolved against it.
+`go list` runs with the watcher's environment, not the build command's: set build tags,
+`GOOS` and `GOARCH` through the environment (`GOFLAGS=-tags=...`) so both see the same
+packages. A tag passed only inside `--build` can leave a package out of the list, and its
+edits are then ignored. Signals and file events are read through `signalfd` and
+inotify, so `gocut watch` runs on Linux only.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--bin <path>` | required | The binary the build writes. Its directory is not watched. |
+| `--build <cmd>` | required | Shell command that builds `--bin`. |
+| `--run <cmd>` | `--bin` | Shell command that runs the server. |
+| `--pkg <pattern>` | none | Main package whose dependencies decide which edits rebuild; repeatable. Without it, every non-test `.go` file under the root counts. |
+| `--restart <path>` | none | File, or directory of files, whose change restarts the server without a build; repeatable. Files the build also reads still build. |
+| `--root <dir>` | `.` | Directory watched recursively, and where `go list` runs. |
+| `--exclude <dir>` | none | Directory name or root-relative path not to watch; repeatable. Hidden and `_` directories, `testdata` and `node_modules` are never watched. |
+| `--delay <ms>` | `300` | Quiet period after the last relevant change before a build starts. |
+| `--kill-delay <ms>` | `2000` | How long a stopped build or server has after SIGINT before SIGKILL. |
 
 ### Environment
 
@@ -148,6 +201,7 @@ gocut's own `GOCUT_*` settings, so changing a gocut setting keeps existing recor
 |---|---|
 | `gocut stats [seconds]` | Summarise the event log, optionally only the last N seconds: decisions, shadow matches and mismatches, compile time a verified reuse would have skipped, top reasons for no reuse, gocut's own overhead, and gocut's time per reused package (median, p90, mean) with a per-phase breakdown from each event's `phases`. |
 | `gocut clear-log` | Delete the event log. |
+| `gocut watch ...` | Rebuild and restart a program when a file it is built from changes; see [Hot reload](#hot-reload-gocut-watch). |
 | `gocut gc` | Run eviction now and print the store size before and after. |
 | `gocut dumphash <archive> <pkgpath>` | Debugging: recompute the content hashes of an archive's hashed symbols and report any that differ from the stored ones. |
 
@@ -288,9 +342,13 @@ GOCACHE=/path/to/gocut-gocache go clean -cache   # clear a dedicated Go cache
 ```sh
 cargo build --release
 cargo test
+cargo clippy --all-targets   # lints are configured in Cargo.toml and clippy.toml
+cargo fmt                    # rustfmt.toml: 120 columns
 ```
 
-Unit tests cover the export data position masking and hashing and the source scanner.
+Unit tests cover the export data position masking and hashing, the source scanner, and `gocut
+watch`'s option parsing, `go list` closure and relevance rules, inotify event parsing, content
+dedupe, and process-group shutdown.
 
 ### Toy matrix
 
