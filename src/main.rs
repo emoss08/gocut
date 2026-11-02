@@ -385,12 +385,27 @@ impl<'a> HashCache<'a> {
     }
 }
 
-fn lsyms_for(st: &Store, fp: &str, ex: &Export) -> LsymTable {
-    st.read_lsyms(fp).unwrap_or_else(|| {
-        let t = patch::lsym_table(ex);
-        let _ = st.write_lsyms(fp, &t);
-        t
-    })
+fn lsyms_for(st: &Store, fp: &str, ex: Option<&Export>) -> Result<LsymTable> {
+    if let Some(t) = st.read_lsyms(fp) {
+        return Ok(t);
+    }
+    let t = patch::lsym_table(ex.context("symbol table evicted")?);
+    let _ = st.write_lsyms(fp, &t);
+    Ok(t)
+}
+
+
+// The non-local names an archive's own export data carries copies of.
+fn copied_idents(archive: &[u8], self_path: &str) -> Result<Vec<(String, String)>> {
+    let pkgdef = ar::member_data(archive, "__.PKGDEF").context("no __.PKGDEF")?;
+    let loc = export::locate(pkgdef)?;
+    let ex = Export::parse(&pkgdef[loc.bits_start..loc.bits_end], self_path, loc.new_inliner)?;
+    Ok(ex
+        .idents
+        .into_iter()
+        .filter(|id| id.path != self_path && id.tag != export::Tag::Stub)
+        .map(|id| (id.path, id.name))
+        .collect())
 }
 
 fn decide(
@@ -405,26 +420,58 @@ fn decide(
         if rec.roots.all.contains(p) {
             return Ok(Decision::blocked(BlockKind::DotImport, format!("dot import of {p}")));
         }
-        let fp = &rec.deps[p];
-        if let Entry::Vacant(slot) = olds.entry(fp.clone()) {
-            slot.insert(timed("read_old_export", || st.read_export(fp)).with_context(|| format!("old export data of {p}"))?);
-        }
     }
-    let olds = &*olds;
-    let mut pairs = Vec::with_capacity(changed.len());
+    struct Dep<'x> {
+        p: &'x str,
+        ofp: &'x str,
+        nfp: &'x str,
+        new: Export<'x>,
+        canon: (String, String),
+        need_old: bool,
+    }
+    let mut ds = Vec::with_capacity(changed.len());
     for p in changed {
         let (d, ofp, nfp) = (&prep.deps[p], rec.deps[p].as_str(), prep.fps[p].as_str());
         let ni = timed("read_new_export", || d.new_inliner())?;
-        let old = timed("parse_dep", || Export::parse(&olds[ofp], p, ni))?;
         let new = timed("parse_dep", || Export::parse(d.bits()?, p, ni))?;
         let _ = timed("write_export", || st.write_export(nfp, d.bits()?));
-        let (oc, nc) = (st.canonical(ofp), st.canonical(nfp));
+        let canon = (st.canonical(ofp), st.canonical(nfp));
+        ds.push(Dep { p, ofp, nfp, new, canon, need_old: true });
+    }
+    let mut old_out = None;
+    // A dependency whose new export data hashes like its old needs the old export data only to
+    // walk objects this package copies from it, or to rebuild a missing symbol table.
+    if !ca.full_dwarf && ds.iter().any(|d| d.canon.0 == d.canon.1) {
+        let out = old_out.insert(timed("read_blob", || st.read_blob(&rec.out))?);
+        let copied = timed("copied", || copied_idents(out, &ca.pkg))?;
+        for d in ds.iter_mut().filter(|d| d.canon.0 == d.canon.1) {
+            d.need_old =
+                !st.has_lsyms(d.ofp) || copied.iter().any(|(path, name)| d.new.find(path, name).is_some());
+        }
+    }
+    for d in ds.iter().filter(|d| d.need_old) {
+        if let Entry::Vacant(slot) = olds.entry(d.ofp.to_string()) {
+            slot.insert(
+                timed("read_old_export", || st.read_export(d.ofp)).with_context(|| format!("old export data of {}", d.p))?,
+            );
+        }
+    }
+    let olds = &*olds;
+    let mut pairs = Vec::with_capacity(ds.len());
+    for d in &ds {
+        let p = d.p;
+        let old = match d.need_old {
+            true => Some(timed("parse_dep", || Export::parse(&olds[d.ofp], p, d.new.new_inliner()))?),
+            false => None,
+        };
+        let (oc, nc) = &d.canon;
         if oc == nc {
             // gocut produced the new export data from the old by moving positions only; it hashes the same.
-            pairs.push((ofp, nfp, old, new));
+            pairs.push((d.ofp, d.nfp, old, &d.new));
             continue;
         }
-        let (of, nf) = (pkg_facts(st, &oc, &old)?, pkg_facts(st, &nc, &new)?);
+        let old = old.context("old export data not loaded")?;
+        let (of, nf) = (pkg_facts(st, oc, &old)?, pkg_facts(st, nc, &d.new)?);
         if of.0 != nf.0 || of.1 != nf.1 {
             return Ok(Decision::blocked(BlockKind::PkgIdentity, format!("{p}: package name or init changed")));
         }
@@ -432,34 +479,40 @@ fn decide(
             return Ok(Decision::blocked(BlockKind::ImportGraph, format!("{p}: import graph changed")));
         }
         if let Some(names) = rec.roots.names.get(p) {
-            let _t = std::time::Instant::now();
-            let (mut oc, mut nc) = (HashCache::open(st, &oc), HashCache::open(st, &nc));
+            let t = Instant::now();
+            let (mut oh, mut nh) = (HashCache::open(st, oc), HashCache::open(st, nc));
             let mut differs = None;
             for n in names {
-                if oc.get(&old, p, n)? != nc.get(&new, p, n)? {
+                if oh.get(&old, p, n)? != nh.get(&d.new, p, n)? {
                     differs = Some(n);
                     break;
                 }
             }
-            oc.flush(st);
-            nc.flush(st);
-            store::add_phase("uses", ms(_t));
+            oh.flush(st);
+            nh.flush(st);
+            store::add_phase("uses", ms(t));
             if let Some(n) = differs {
                 return Ok(Decision::blocked(BlockKind::UsesChanged, format!("uses changed {p}.{n}")));
             }
         }
-        pairs.push((ofp, nfp, old, new));
+        pairs.push((d.ofp, d.nfp, Some(old), &d.new));
     }
     let lsyms: Vec<(LsymTable, LsymTable)> = timed("lsyms", || {
-        pairs.iter().map(|(ofp, nfp, old, new)| (lsyms_for(st, ofp, old), lsyms_for(st, nfp, new))).collect()
-    });
+        pairs
+            .iter()
+            .map(|(ofp, nfp, old, new)| Ok((lsyms_for(st, ofp, old.as_ref())?, lsyms_for(st, nfp, Some(new))?)))
+            .collect::<Result<_>>()
+    })?;
     let deps: Vec<patch::ChangedDep> = pairs
         .iter()
         .zip(&lsyms)
-        .map(|((_, _, old, new), (ol, nl))| patch::ChangedDep { old, new, old_lsyms: ol, new_lsyms: nl })
+        .map(|((_, _, old, new), (ol, nl))| patch::ChangedDep { old: old.as_ref(), new, old_lsyms: ol, new_lsyms: nl })
         .collect();
     let new_fps: HashMap<String, [u8; 8]> = prep.deps.iter().map(|(k, d)| (k.clone(), d.fp)).collect();
-    let old_out = timed("read_blob", || st.read_blob(&rec.out))?;
+    let old_out = match old_out {
+        Some(o) => o,
+        None => timed("read_blob", || st.read_blob(&rec.out))?,
+    };
     let target = patch::Target {
         old_archive: &old_out,
         self_path: &ca.pkg,

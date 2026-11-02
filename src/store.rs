@@ -420,6 +420,10 @@ impl Store {
         self.write_once(&self.shard("ex", fp, "pkg"), || Ok(s.into_bytes()))
     }
 
+    pub fn has_lsyms(&self, fp: &str) -> bool {
+        self.shard("ex", fp, "lsym").exists()
+    }
+
     pub fn read_lsyms(&self, fp: &str) -> Option<LsymTable> {
         decode_lsyms(&std::fs::read(self.shard("ex", fp, "lsym")).ok()?)
     }

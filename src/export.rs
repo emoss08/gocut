@@ -756,6 +756,10 @@ impl<'a> Export<'a> {
         self.closure_hash(Section::Pkg, self.self_pkg)
     }
 
+    pub fn new_inliner(&self) -> bool {
+        self.new_inliner
+    }
+
     pub fn find(&self, path: &str, name: &str) -> Option<u32> {
         self.by_ident.get(path)?.get(name).copied()
     }

@@ -23,7 +23,9 @@ impl fmt::Display for Guard {
 impl std::error::Error for Guard {}
 
 pub struct ChangedDep<'a> {
-    pub old: &'a Export<'a>,
+    /// None when the caller knows this package copies nothing from the dependency and the new
+    /// export data hashes like the old (see patch_pkgdef and the full-DWARF guard).
+    pub old: Option<&'a Export<'a>>,
     pub new: &'a Export<'a>,
     pub old_lsyms: &'a LsymTable,
     pub new_lsyms: &'a LsymTable,
@@ -163,13 +165,30 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Resul
         if id.path == self_path || id.tag == export::Tag::Stub {
             continue;
         }
-        let src = changed.iter().enumerate().find_map(|(di, d)| d.old.find(&id.path, &id.name).map(|io| (di, d, io)));
-        let Some((di, d, io)) = src else { continue };
+        let mut src = None;
+        for (di, d) in changed.iter().enumerate() {
+            match d.old {
+                Some(o) => {
+                    if let Some(io) = o.find(&id.path, &id.name) {
+                        src = Some((di, d, o, io));
+                        break;
+                    }
+                }
+                None => ensure!(
+                    d.new.find(&id.path, &id.name).is_none(),
+                    "{}.{} copied from {} without its old export data",
+                    id.path,
+                    id.name,
+                    d.new.self_path
+                ),
+            }
+        }
+        let Some((di, d, old, io)) = src else { continue };
         let inn = d
             .new
             .find(&id.path, &id.name)
-            .with_context(|| format!("copied {}.{} vanished from {}", id.path, id.name, d.old.self_path))?;
-        Walk { p: &ex, o: d.old, n: d.new, seen: &mut seen[di], decided: &mut decided, replaced: &mut replaced }
+            .with_context(|| format!("copied {}.{} vanished from {}", id.path, id.name, old.self_path))?;
+        Walk { p: &ex, o: old, n: d.new, seen: &mut seen[di], decided: &mut decided, replaced: &mut replaced }
             .run(Section::Obj, i as u32, io, inn)?;
     }
     crate::store::add_phase("p_walk", tw.elapsed().as_secs_f64() * 1000.0);
@@ -195,16 +214,17 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep]) -> Resul
 
 fn moved_types<'n>(d: &ChangedDep, want: &HashSet<&'n str>) -> Result<HashSet<&'n str>> {
     let mut types = HashSet::new();
-    for (oi, id) in d.old.idents.iter().enumerate() {
-        if id.path != d.old.self_path || id.tag != export::Tag::Type {
+    let old = d.old.context("old export data not loaded")?;
+    for (oi, id) in old.idents.iter().enumerate() {
+        if id.path != old.self_path || id.tag != export::Tag::Type {
             continue;
         }
         let Some(&name) = want.get(id.name.as_str()) else { continue };
         let Some(ni) = d.new.find(&id.path, &id.name) else { continue };
-        if d.old.pb.raw(Section::Obj, oi as u32)? == d.new.pb.raw(Section::Obj, ni)? {
+        if old.pb.raw(Section::Obj, oi as u32)? == d.new.pb.raw(Section::Obj, ni)? {
             continue;
         }
-        let os = d.old.pos_slots(Section::Obj, oi as u32)?;
+        let os = old.pos_slots(Section::Obj, oi as u32)?;
         let ns = d.new.pos_slots(Section::Obj, ni)?;
         if os.len() != ns.len() || os.iter().zip(&ns).any(|(a, b)| (a.line, a.col) != (b.line, b.col)) {
             types.insert(name);
@@ -221,7 +241,7 @@ fn guard_moved_methods(
     maps: &IndexMaps,
 ) -> Result<()> {
     let dep_of: Vec<Option<usize>> =
-        pkgs.iter().map(|p| changed.iter().position(|d| d.old.self_path == *p)).collect();
+        pkgs.iter().map(|p| changed.iter().position(|d| d.new.self_path == *p)).collect();
     let mut calls = Vec::new();
     for &site in sites {
         let r = Obj::symref_at(b, site);
@@ -248,7 +268,7 @@ fn guard_moved_methods(
     match calls.iter().find(|&&(di, name)| moved[di].contains(name)) {
         Some(&(di, name)) => Err(Guard(format!(
             "calls methods of {}.{name}, whose declaration lines moved (wrapper debug info would change)",
-            changed[di].old.self_path
+            changed[di].new.self_path
         ))
         .into()),
         None => Ok(()),

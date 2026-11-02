@@ -55,6 +55,22 @@ pub fn write(members: &[Member]) -> Vec<u8> {
     out
 }
 
+pub fn member_data<'b>(b: &'b [u8], want: &str) -> Option<&'b [u8]> {
+    let mut i = MAGIC.len();
+    if !b.starts_with(MAGIC) {
+        return None;
+    }
+    while i < b.len() {
+        let (name, size) = header(b.get(i..i + HEADER_LEN)?).ok()?;
+        let start = i + HEADER_LEN;
+        if name == want {
+            return b.get(start..start + size);
+        }
+        i = start + size + (size & 1);
+    }
+    None
+}
+
 pub fn member<'m>(ms: &'m [Member], name: &str) -> Option<&'m Member> {
     ms.iter().find(|m| m.name == name)
 }
