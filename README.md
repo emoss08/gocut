@@ -231,8 +231,9 @@ median of about 170 to 240 ms per reused package.
 
 ## Limits
 
-- Only Go 1.27's unified IR export data (version 4) has been tested. Export data with sync
-  markers is rejected, and wasm export data is not supported.
+- Only Go 1.27's unified IR export data (version 4) is supported. gocut refuses any other version
+  and compiles the package normally, so a Go upgrade costs reuse, not correctness. Export data
+  with sync markers is rejected, and wasm export data is not supported.
 - Only amd64 has been tested.
 - Positions inside generic or inlinable function bodies are not masked. If a function a package
   uses has a body in export data and that body's lines move, the package is recompiled. Masking

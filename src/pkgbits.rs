@@ -40,6 +40,11 @@ pub const VERSION_FLAGS: u32 = 1;
 pub const VERSION_GENERIC_METHODS: u32 = 4;
 const FLAG_SYNC_MARKERS: u32 = 1;
 
+/// The export data versions gocut's masking and patching have been verified against (Go 1.27's
+/// unified IR). Any other version is refused, so the package is compiled normally: a later Go may
+/// change what a field means without changing its layout, which masking would not notice.
+pub const SUPPORTED_VERSIONS: &[u32] = &[VERSION_GENERIC_METHODS];
+
 pub struct PkgBits<'a> {
     pub version: u32,
     pub flags: u32,
@@ -69,6 +74,9 @@ impl<'a> PkgBits<'a> {
     pub fn parse(input: &'a [u8]) -> Result<PkgBits<'a>> {
         let mut off = 0;
         let version = read_u32(input, off)?;
+        if !SUPPORTED_VERSIONS.contains(&version) {
+            bail!("export data version {version} is not one gocut supports ({SUPPORTED_VERSIONS:?})");
+        }
         off += 4;
         let mut flags = 0;
         if version >= VERSION_FLAGS {
@@ -243,4 +251,19 @@ pub fn dump(version: u32, flags: u32, ends_ends: &[u32; NUM_SECTIONS], elems: &[
     let fp = Sha256::digest(&out);
     out.extend_from_slice(&fp[..8]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_unsupported_versions() {
+        for v in [0u32, 1, 2, 3, 5] {
+            let mut input = v.to_le_bytes().to_vec();
+            input.extend_from_slice(&[0u8; 64]);
+            let err = PkgBits::parse(&input).err().expect("parse should refuse");
+            assert!(err.to_string().contains("not one gocut supports"), "version {v}: {err}");
+        }
+    }
 }
