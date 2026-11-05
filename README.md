@@ -2,7 +2,7 @@
 
 [![Go 1.27](https://img.shields.io/badge/go-1.27-00ADD8?logo=go)](#requirements)
 [![Rust 2024](https://img.shields.io/badge/rust-2024_edition-orange?logo=rust)](Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 `gocut` makes incremental `go build` faster on large Go codebases. It is a `go build -toolexec`
 wrapper that adds symbol-level early cutoff to the Go compiler: when a package is recompiled
@@ -445,4 +445,4 @@ already strips DWARF with `-w`).
 
 ## License
 
-MIT
+[MIT](LICENSE)
