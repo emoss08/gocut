@@ -1,5 +1,6 @@
 # gocut — Faster Incremental Go Builds with Symbol-Level Early Cutoff
 
+[![CI](https://github.com/emoss08/gocut/actions/workflows/ci.yml/badge.svg)](https://github.com/emoss08/gocut/actions/workflows/ci.yml)
 [![Go 1.27](https://img.shields.io/badge/go-1.27-00ADD8?logo=go)](#requirements)
 [![Rust 2024](https://img.shields.io/badge/rust-2024_edition-orange?logo=rust)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -45,9 +46,10 @@ For a full edit-rebuild-restart loop, see [`gocut watch`](#hot-reload-gocut-watc
 
 ### Requirements
 
-- Go 1.27 (unified IR export data, version 4). Any other version is compiled normally, without
-  reuse.
-- A Rust toolchain with edition 2024 support (Rust 1.85 or newer) to build gocut.
+- Go 1.27.1 (unified IR export data, version 4). Any other version is compiled normally, without
+  reuse. Later 1.27 patch releases currently get no reuse either: on 1.27.2 every changed
+  dependency is blocked as a dot import, and 1.27.3 writes export data version 5.
+- Rust 1.88 or newer to build gocut.
 - A Unix-like OS. `gocut watch` needs Linux (inotify and signalfd). Only Linux on amd64 has
   been tested.
 
@@ -388,6 +390,10 @@ cargo test
 cargo clippy --all-targets   # lints are configured in Cargo.toml and clippy.toml
 cargo fmt                    # rustfmt.toml: 120 columns
 ```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy with warnings as errors, the
+unit tests on Linux and macOS, a build and test on the minimum Rust version (1.88), and the toy
+matrix below in shadow and active mode across all three flag modes, on Go 1.27.1.
 
 Unit tests cover the export data position masking and hashing, the source scanner, and `gocut
 watch`'s option parsing, `go list` closure and relevance rules, inotify event parsing, content
