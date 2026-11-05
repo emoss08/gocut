@@ -1,12 +1,55 @@
-# gocut
+# gocut — Faster Incremental Go Builds with Symbol-Level Early Cutoff
 
-`gocut` is a `go build -toolexec` wrapper that adds symbol-level early cutoff to Go builds.
-When a package is recompiled only because a dependency's export data changed, and nothing the
-package uses from that dependency changed, gocut reuses the package's previous compiled archive
-and patches it instead of running the compiler.
+[![Go 1.27](https://img.shields.io/badge/go-1.27-00ADD8?logo=go)](#requirements)
+[![Rust 2024](https://img.shields.io/badge/rust-2024_edition-orange?logo=rust)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](Cargo.toml)
+
+`gocut` makes incremental `go build` faster on large Go codebases. It is a `go build -toolexec`
+wrapper that adds symbol-level early cutoff to the Go compiler: when a package is recompiled
+only because a dependency's export data changed, and nothing the package uses from that
+dependency changed, gocut reuses the package's previous compiled archive and patches it instead
+of running the compiler. It also ships `gocut watch`, a hot-reload loop that rebuilds and
+restarts your server.
+
+On [Trenova](https://trenova.app)'s API server, where one edit to a widely imported package
+recompiles 1,042 packages, rebuilds go from about **82 s to 30 s (about 2.7× faster)**, and
+every verified reuse was byte-identical to the compiler's output. See [Measured so far](#measured-so-far).
 
 It is meant for local hot-reload loops on large Go programs. It is not meant for CI or release
 builds.
+
+**Contents:** [Quick start](#quick-start) · [Why](#why) · [How it decides](#how-it-decides) ·
+[Safety model](#safety-model) · [Usage](#usage) · [Hot reload](#hot-reload-gocut-watch) ·
+[Measured so far](#measured-so-far) · [Limits](#limits) · [Disk use](#disk-use) ·
+[Development](#development)
+
+## Quick start
+
+```sh
+# 1. Build gocut (or: cargo install --git https://github.com/emoss08/gocut)
+cargo build --release
+
+# 2. Build through it. The first build is cold; gocut records every package it compiles.
+go build -toolexec="$PWD/target/release/gocut" -o ./bin/app ./cmd/app
+
+# 3. Edit a widely imported package and rebuild. Shadow mode (the default) still compiles
+#    everything and checks that gocut's patched output would have been byte-identical.
+go build -toolexec="$PWD/target/release/gocut" -o ./bin/app ./cmd/app
+target/release/gocut stats
+
+# 4. Once shadow mode reports matches on your code, skip the compiler for real.
+GOCUT_MODE=active go build -toolexec="$PWD/target/release/gocut" -o ./bin/app ./cmd/app
+```
+
+For a full edit-rebuild-restart loop, see [`gocut watch`](#hot-reload-gocut-watch).
+
+### Requirements
+
+- Go 1.27 (unified IR export data, version 4). Any other version is compiled normally, without
+  reuse.
+- A Rust toolchain with edition 2024 support (Rust 1.85 or newer) to build gocut.
+- A Unix-like OS. `gocut watch` needs Linux (inotify and signalfd). Only Linux on amd64 has
+  been tested.
 
 ## Why
 
