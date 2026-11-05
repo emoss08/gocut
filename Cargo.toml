@@ -2,6 +2,7 @@
 name = "gocut"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Symbol-level early cutoff for go build, as a -toolexec wrapper"
 license = "MIT"
 
