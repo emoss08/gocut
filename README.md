@@ -222,8 +222,45 @@ inotify, so `gocut watch` runs on Linux only.
 | `--restart <path>` | none | File, or directory of files, whose change restarts the server without a build; repeatable. Files the build also reads still build. |
 | `--root <dir>` | `.` | Directory watched recursively, and where `go list` runs. |
 | `--exclude <dir>` | none | Directory name or root-relative path not to watch; repeatable. Hidden and `_` directories, `testdata` and `node_modules` are never watched. |
+| `--ignore <pattern>` | none | Ignore pattern, applied after the ones in `.gocutignore`; repeatable. See [Ignoring files](#ignoring-files). |
 | `--delay <ms>` | `300` | Quiet period after the last relevant change before a build starts. |
 | `--kill-delay <ms>` | `2000` | How long a stopped build or server has after SIGINT before SIGKILL. |
+
+#### Ignoring files
+
+Test files (`_test.go`) and `testdata` directories never start a build. To ignore more, such
+as generated mocks or fixtures, list gitignore-style patterns in `.gocutignore` in `--root`, or
+pass them with `--ignore`. A file that matches never starts a build or a restart, even if the
+build reads it, and a directory that matches is not watched.
+
+```gitignore
+# Generated mocks, wherever they are.
+*_mock.go
+mocks/
+
+# Root-relative paths: a pattern with a / in it is anchored to --root.
+internal/gen/*.go
+/tools/
+
+# ** crosses directories; ! re-includes, and the last matching pattern wins.
+**/fixtures/**
+*_gen.go
+!wire_gen.go
+```
+
+- A pattern with no `/` (other than a trailing one) matches a file or directory name at any depth.
+  A pattern with a `/` anywhere else matches the path relative to `--root`. A leading `/` only
+  anchors it.
+- A trailing `/` matches directories only.
+- `*` matches anything except `/`, `?` one character except `/`, `[abc]`, `[a-z]` and `[!abc]` one
+  character from a set or not in it, and `**` anything including `/`.
+- `#` starts a comment and `!` negates. Escape either with `\` to match it literally. As with
+  gitignore, a file under an ignored directory cannot be re-included.
+- Patterns apply only under `--root`. A package outside it, such as one reached through a
+  `replace`, is not affected.
+
+Since an ignored file never triggers a rebuild, ignoring one the binary is built from leaves the
+server running old code until something else changes.
 
 ### Environment
 
@@ -396,8 +433,8 @@ unit tests on Linux and macOS, a build and test on the minimum Rust version (1.8
 matrix below in shadow and active mode across all three flag modes, on Go 1.27.1.
 
 Unit tests cover the export data position masking and hashing, the source scanner, and `gocut
-watch`'s option parsing, `go list` closure and relevance rules, inotify event parsing, content
-dedupe, and process-group shutdown.
+watch`'s option parsing, `go list` closure and relevance rules, ignore patterns, inotify event
+parsing, content dedupe, and process-group shutdown.
 
 ### Toy matrix
 

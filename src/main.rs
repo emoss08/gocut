@@ -2,6 +2,8 @@ mod ar;
 mod export;
 mod fx;
 mod goobj;
+#[cfg(target_os = "linux")]
+mod ignore;
 mod patch;
 mod pkgbits;
 mod store;

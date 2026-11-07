@@ -12,6 +12,7 @@
 // - A build whose binary is byte-identical to the running one does not restart the server.
 // - With --restart, a change to a file the server reads at startup (its config) restarts the
 //   server with the binary it has, without a build.
+// - Files matching a pattern in `.gocutignore` or --ignore never start a build or a restart.
 //
 // Linux only: it uses inotify for file events and signalfd for signals and child exits.
 
@@ -27,8 +28,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::ignore::{self, Ignore, Kind};
+
 pub(crate) const USAGE: &str = "usage: gocut watch --bin <path> --build <cmd> [--run <cmd>] [--pkg <pattern>]... \
-[--restart <path>]... [--root <dir>] [--exclude <dir>]... [--delay <ms>] [--kill-delay <ms>]";
+[--restart <path>]... [--root <dir>] [--exclude <dir>]... [--ignore <pattern>]... [--delay <ms>] [--kill-delay <ms>]";
 
 macro_rules! say {
     ($($t:tt)*) => { eprintln!("{} gocut watch: {}", clock(), format_args!($($t)*)) };
@@ -49,6 +52,8 @@ pub(crate) struct Options {
     root: PathBuf,
     // Directory names or root-relative paths not to watch.
     excludes: Vec<String>,
+    // Ignore patterns, applied after the ones in `.gocutignore`.
+    ignores: Vec<String>,
     // Quiet period after the last relevant change before a build starts.
     delay: Duration,
     // How long a stopped server or build has after SIGINT before it is killed.
@@ -64,6 +69,7 @@ pub(crate) fn parse_options(args: &[String]) -> Result<Options> {
         restart: Vec::new(),
         root: PathBuf::from("."),
         excludes: Vec::new(),
+        ignores: Vec::new(),
         delay: Duration::from_millis(300),
         kill_delay: Duration::from_secs(2),
     };
@@ -87,6 +93,7 @@ pub(crate) fn parse_options(args: &[String]) -> Result<Options> {
             "--restart" => o.restart.push(value()?.into()),
             "--root" => o.root = value()?.into(),
             "--exclude" => o.excludes.push(value()?),
+            "--ignore" => o.ignores.push(value()?),
             "--delay" => o.delay = millis(flag, &value()?)?,
             "--kill-delay" => o.kill_delay = millis(flag, &value()?)?,
             _ => bail!("unknown argument {a}\n{USAGE}"),
@@ -200,8 +207,9 @@ fn relevant(closure: Option<&Closure>, path: &Path) -> bool {
 }
 
 // Directories the tree walk does not enter: hidden and underscore directories and testdata, which
-// the go command ignores, node_modules, the directory the binary is written to, and --exclude.
-fn skip_dir(root: &Path, bin: &Path, excludes: &[String], dir: &Path) -> bool {
+// the go command ignores, node_modules, the directory the binary is written to, --exclude, and
+// directories an ignore pattern matches.
+fn skip_dir(root: &Path, bin: &Path, excludes: &[String], ignore: &Ignore, dir: &Path) -> bool {
     let Some(name) = dir.file_name().and_then(OsStr::to_str) else {
         return true;
     };
@@ -213,6 +221,13 @@ fn skip_dir(root: &Path, bin: &Path, excludes: &[String], dir: &Path) -> bool {
     }
     let rel = dir.strip_prefix(root).unwrap_or(dir);
     excludes.iter().any(|e| e == name || Path::new(e.trim_start_matches("./")) == rel)
+        || is_ignored(root, ignore, dir, Kind::Dir)
+}
+
+// Whether an ignore pattern matches `path`. Patterns are relative to the root, so a path outside
+// it (a `replace` to a sibling module, a --restart path elsewhere) is never ignored.
+fn is_ignored(root: &Path, ignore: &Ignore, path: &Path, kind: Kind) -> bool {
+    path.strip_prefix(root).is_ok_and(|rel| ignore.matches(rel, kind))
 }
 
 // What a change asks for. A build restarts the server too, so it outranks a restart.
@@ -575,6 +590,7 @@ struct Watcher {
     modcache: Option<PathBuf>,
     gowork: Option<PathBuf>,
     ino: Inotify,
+    ignore: Ignore,
     closure: Option<Closure>,
     hashes: Hashes,
     build: Option<Proc>,
@@ -604,6 +620,8 @@ pub(crate) fn run(o: Options) -> Result<ExitCode> {
     let run = o.run.clone().unwrap_or_else(|| bin.display().to_string());
     let restart: Vec<PathBuf> = o.restart.iter().map(|p| absolute(&root, p)).collect();
     let (modcache, gowork) = go_env(&root);
+    let mut ignore = Ignore::load(&root)?;
+    o.ignores.iter().for_each(|p| ignore.add(p));
     let mut w = Watcher {
         o,
         root,
@@ -612,6 +630,7 @@ pub(crate) fn run(o: Options) -> Result<ExitCode> {
         modcache,
         gowork,
         ino: Inotify::new()?,
+        ignore,
         closure: None,
         hashes: Hashes::default(),
         build: None,
@@ -626,6 +645,9 @@ pub(crate) fn run(o: Options) -> Result<ExitCode> {
     };
     w.watch_all()?;
     w.relist();
+    if w.ignore.len() > 0 {
+        say!("{} ignore patterns from {} and --ignore", w.ignore.len(), ignore::FILE);
+    }
     say!("watching {} directories", w.ino.watched.len());
     let result = w.serve(&signals);
     if result.is_err() {
@@ -685,14 +707,14 @@ impl Watcher {
     }
 
     fn skip_dir(&self, dir: &Path) -> bool {
-        skip_dir(&self.root, &self.bin, &self.o.excludes, dir)
+        skip_dir(&self.root, &self.bin, &self.o.excludes, &self.ignore, dir)
     }
 
     // Watches the root, the --restart paths and go.work's directory. Adding a watch that exists is
     // a no-op, so this also repairs the watches after the event queue overflowed.
     fn watch_all(&mut self) -> Result<()> {
-        let (root, bin, excludes) = (&self.root, &self.bin, &self.o.excludes);
-        let skip = |d: &Path| skip_dir(root, bin, excludes, d);
+        let (root, bin, excludes, ignore) = (&self.root, &self.bin, &self.o.excludes, &self.ignore);
+        let skip = |d: &Path| skip_dir(root, bin, excludes, ignore, d);
         self.ino.add_tree(root, &skip)?;
         // A --restart path outside the root, or in a directory the walk skips, is watched on its own.
         for p in &self.restart {
@@ -709,8 +731,8 @@ impl Watcher {
     }
 
     fn watch_tree(&mut self, top: &Path) -> Result<()> {
-        let (root, bin, excludes) = (&self.root, &self.bin, &self.o.excludes);
-        self.ino.add_tree(top, &|d| skip_dir(root, bin, excludes, d))
+        let (root, bin, excludes, ignore) = (&self.root, &self.bin, &self.o.excludes, &self.ignore);
+        self.ino.add_tree(top, &|d| skip_dir(root, bin, excludes, ignore, d))
     }
 
     // Reruns go list for --pkg and watches every package directory it reports, including ones
@@ -797,6 +819,10 @@ impl Watcher {
         let mut config = false;
         let mut ignored = Vec::new();
         for path in paths {
+            // An ignored file asks for nothing, and is not reported as outside the package list.
+            if is_ignored(&self.root, &self.ignore, &path, Kind::File) {
+                continue;
+            }
             let Some(work) = classify(self.closure.as_ref(), &self.restart, &path) else {
                 if is_go_source(&path) {
                     ignored.push(path);
@@ -991,6 +1017,7 @@ mod tests {
             "--restart=extra.yaml",
             "--exclude",
             "ui",
+            "--ignore=*_mock.go",
             "--delay",
             "50",
         ]))
@@ -1005,6 +1032,7 @@ mod tests {
                 restart: vec![PathBuf::from("config"), PathBuf::from("extra.yaml")],
                 root: PathBuf::from("."),
                 excludes: vec!["ui".into()],
+                ignores: vec!["*_mock.go".into()],
                 delay: Duration::from_millis(50),
                 kill_delay: Duration::from_secs(2),
             }
@@ -1107,7 +1135,9 @@ mod tests {
         let root = Path::new("/r");
         let bin = Path::new("/r/tmp/app");
         let excludes = vec!["ui".to_string(), "./internal/gen".to_string()];
-        let skip = |d: &str| skip_dir(root, bin, &excludes, Path::new(d));
+        let mut ignore = Ignore::default();
+        ignore.add("fixtures/");
+        let skip = |d: &str| skip_dir(root, bin, &excludes, &ignore, Path::new(d));
         assert!(skip("/r/tmp"));
         assert!(skip("/r/.git"));
         assert!(skip("/r/_old"));
@@ -1118,8 +1148,10 @@ mod tests {
         assert!(!skip("/r/internal/gen2"));
         assert!(!skip("/r/internal/tmp"));
         assert!(!skip("/r/cmd/app"));
+        assert!(skip("/r/pkg/fixtures"));
+        assert!(!skip("/r/pkg/fixtures2"));
         // A binary written to the root does not exclude the root.
-        assert!(!skip_dir(root, Path::new("/r/app"), &[], root));
+        assert!(!skip_dir(root, Path::new("/r/app"), &[], &Ignore::default(), root));
     }
 
     fn raw(wd: i32, mask: u32, name: &[u8], len: usize) -> Vec<u8> {
@@ -1296,6 +1328,7 @@ mod tests {
             modcache: None,
             gowork: None,
             ino: Inotify::new().unwrap(),
+            ignore: Ignore::default(),
             closure: Some(closure),
             hashes: Hashes::default(),
             build: None,
@@ -1377,5 +1410,37 @@ mod tests {
         w.consider(vec![dir.0.join("internal/newpkg/x.go")], None);
         assert!(w.due.is_none());
         assert!(w.deferred.is_empty());
+    }
+
+    #[test]
+    fn an_ignored_file_starts_nothing_even_when_the_build_reads_it() {
+        let (dir, closure) = module("ignore");
+        std::fs::write(dir.0.join("cmd/app/store_mock.go"), "package main").unwrap();
+        let mut w = watcher(&dir.0, &["config"], closure);
+        w.ignore.add("*_mock.go");
+        w.ignore.add("/config/");
+        w.ignore.add("internal/newpkg/");
+        w.consider(
+            vec![
+                dir.0.join("cmd/app/store_mock.go"),
+                dir.0.join("config/config.yaml"),
+                dir.0.join("internal/newpkg/x.go"),
+            ],
+            None,
+        );
+        assert!(w.due.is_none());
+        assert!(w.deferred.is_empty(), "an ignored file is not kept for the next package list");
+
+        w.consider(vec![dir.0.join("cmd/app/main.go")], None);
+        assert_eq!(w.due.as_ref().map(|d| d.1), Some(Work::Build));
+    }
+
+    #[test]
+    fn ignore_patterns_do_not_reach_outside_the_root() {
+        let mut ig = Ignore::default();
+        ig.add("money/");
+        let root = Path::new("/r/mod");
+        assert!(is_ignored(root, &ig, Path::new("/r/mod/money/x.go"), Kind::File));
+        assert!(!is_ignored(root, &ig, Path::new("/r/shared/money/x.go"), Kind::File));
     }
 }
