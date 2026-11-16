@@ -80,7 +80,7 @@ declare -A DESC=(
 	[method-on-unused-type]="add a method to Unused, which nobody uses"
 	[add-unexported-func]="append an unexported func"
 	[add-const-var-type]="append an exported const, var and type"
-	[generics-unrelated]="append generic func Last; q instantiates Box[int] and Pair[string]"
+	[generics-unrelated]="append generic func Last; q instantiates Box[int] (calling its generic method Apply) and Pair[string]"
 	[add-init]="add func init() to a"
 	[comment-only]="edit a doc comment, same line count"
 	[reexport-unrelated]="append an unrelated func; b re-exports a.T in its API (b.Get() a.T)"
@@ -169,6 +169,10 @@ type Box[E any] struct{ Val E }
 
 func (b Box[E]) Get() E { return b.Val }
 
+func (b Box[E]) Apply[U any](f func(E) U) U { return f(b.Val) }
+
+func (b Box[E]) Has() bool { return true }
+
 func Pair[E any](x, y E) [2]E { return [2]E{x, y} }
 
 func Map[E, U any](xs []E, f func(E) U) []U {
@@ -230,6 +234,10 @@ func Run() int {
 	bx := a.Box[int]{Val: 9}
 	pr := a.Pair("x", "yz")
 	n := len(it.Name()) + it.ID + it.Qty + bx.Get() + len(pr[0]) + len(pr[1])
+	n += bx.Apply(func(v int) int { return v * 3 })
+	if bx.Has() {
+		n++
+	}
 	return n + c.Get() + a.QSmall(4) + a.QBig(6) + len(a.Greeting)
 }
 EOF

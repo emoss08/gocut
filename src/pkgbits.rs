@@ -38,12 +38,14 @@ impl Section {
 
 pub(crate) const VERSION_FLAGS: u32 = 1;
 pub(crate) const VERSION_GENERIC_METHODS: u32 = 4;
+pub(crate) const VERSION_PRESERVE_METHOD_ORDER: u32 = 5;
 const FLAG_SYNC_MARKERS: u32 = 1;
 
-/// The export data versions gocut's masking and patching have been verified against (Go 1.27's
-/// unified IR). Any other version is refused, so the package is compiled normally: a later Go may
+/// The export data versions gocut's masking and patching have been verified against: Go 1.27.0 and
+/// 1.27.1 write version 4, and Go 1.27.2 to 1.27.4 write version 5, which adds each method's
+/// declaration index. Any other version is refused, so the package is compiled normally: a later Go may
 /// change what a field means without changing its layout, which masking would not notice.
-pub(crate) const SUPPORTED_VERSIONS: &[u32] = &[VERSION_GENERIC_METHODS];
+pub(crate) const SUPPORTED_VERSIONS: &[u32] = &[VERSION_GENERIC_METHODS, VERSION_PRESERVE_METHOD_ORDER];
 
 pub(crate) struct PkgBits<'a> {
     pub version: u32,
@@ -263,7 +265,7 @@ mod tests {
 
     #[test]
     fn refuses_unsupported_versions() {
-        for v in [0u32, 1, 2, 3, 5] {
+        for v in [0u32, 1, 2, 3, 6] {
             let mut input = v.to_le_bytes().to_vec();
             input.extend_from_slice(&[0u8; 64]);
             let err = PkgBits::parse(&input).err().expect("parse should refuse");

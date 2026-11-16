@@ -294,6 +294,7 @@ fn compute_roots(ca: &CompileArgs, prep: &Prep) -> Result<Roots> {
 #[derive(Clone, Copy)]
 enum BlockKind {
     ImportSet,
+    ExportData,
     DotImport,
     PkgIdentity,
     ImportGraph,
@@ -308,6 +309,7 @@ impl BlockKind {
     fn name(self) -> &'static str {
         match self {
             BlockKind::ImportSet => "import-set",
+            BlockKind::ExportData => "export-data",
             BlockKind::DotImport => "dot-import",
             BlockKind::PkgIdentity => "pkg-identity",
             BlockKind::ImportGraph => "import-graph",
@@ -422,6 +424,20 @@ struct Dep<'x> {
     need_old: bool,
 }
 
+// A changed dependency gocut cannot reason about at all: export data it does not read, or a dot
+// import, whose uses the source scan cannot see.
+fn refuse_changed(rec: &Record, prep: &Prep, changed: &[String]) -> Option<Decision> {
+    for p in changed {
+        if let Err(e) = prep.deps[p].bits().and_then(pkgbits::PkgBits::parse) {
+            return Some(Decision::blocked(BlockKind::ExportData, format!("export data of {p}: {e:#}")));
+        }
+    }
+    changed
+        .iter()
+        .find(|p| rec.roots.all.contains(*p))
+        .map(|p| Decision::blocked(BlockKind::DotImport, format!("dot import of {p}")))
+}
+
 fn decide(
     st: &Store,
     ca: &CompileArgs,
@@ -430,10 +446,8 @@ fn decide(
     changed: &[String],
     olds: &mut HashMap<String, Vec<u8>>,
 ) -> Result<Decision> {
-    for p in changed {
-        if rec.roots.all.contains(p) {
-            return Ok(Decision::blocked(BlockKind::DotImport, format!("dot import of {p}")));
-        }
+    if let Some(d) = refuse_changed(rec, prep, changed) {
+        return Ok(d);
     }
     let mut ds = Vec::with_capacity(changed.len());
     for p in changed {

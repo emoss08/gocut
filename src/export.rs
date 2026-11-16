@@ -449,6 +449,7 @@ impl<'a> Export<'a> {
     fn parse_obj(&self, i: u32) -> Result<ObjInfo> {
         let id = self.idents.get(i as usize).context("object index out of range")?;
         let generic_methods = self.pb.version >= pkgbits::VERSION_GENERIC_METHODS;
+        let method_index = self.pb.version >= pkgbits::VERSION_PRESERVE_METHOD_ORDER;
         let mut r = ER::new(&self.pb, Section::Obj, i)?;
         let shape = match id.tag {
             Tag::Stub => ObjShape::Other,
@@ -480,6 +481,9 @@ impl<'a> Export<'a> {
                     r.ident()?;
                     r.type_param_names(receivers)?;
                     r.param()?;
+                    if method_index {
+                        r.rd.skip_uvarint()?;
+                    }
                     recv = 1;
                 }
                 r.type_param_names(explicits)?;
@@ -495,6 +499,9 @@ impl<'a> Export<'a> {
                 let nm = usize::try_from(r.rd.uvarint()?)?;
                 let mut methods = Vec::with_capacity(nm.min(1024));
                 for _ in 0..nm {
+                    if method_index {
+                        r.rd.skip_uvarint()?;
+                    }
                     r.pos()?;
                     r.ident()?;
                     r.type_param_names(explicits)?;

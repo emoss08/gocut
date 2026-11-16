@@ -14,9 +14,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The toy matrix needs the Go release gocut supports (export data version 4). Later 1.27
-  # patch releases currently fall back to normal compiles, which the matrix counts as failures.
-  GO_VERSION: "1.27.1"
 
 jobs:
   lint:
@@ -71,12 +68,16 @@ jobs:
         run: cargo test --locked
 
   toy-matrix:
-    name: Toy matrix (${{ matrix.mode }})
+    name: Toy matrix (Go ${{ matrix.go }}, ${{ matrix.mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         mode: [shadow, active]
+        # One release per export data version gocut supports: 1.27.1 writes version 4 and
+        # 1.27.4 version 5. Any other version falls back to normal compiles, which the matrix
+        # counts as failures.
+        go: ["1.27.1", "1.27.4"]
     steps:
       - uses: actions/checkout@v5
 
@@ -86,7 +87,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ matrix.go }}
           cache: false
 
       - name: Build gocut
