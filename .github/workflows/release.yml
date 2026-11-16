@@ -1,0 +1,124 @@
+name: Release
+
+# Push an annotated tag vX.Y.Z whose version matches Cargo.toml. This tests and builds gocut for
+# every target below and publishes a GitHub release with the archives, SHA256SUMS and the tag's
+# annotation as the release notes. Re-running it replaces the assets of the existing release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Check the tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare versions
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Built on the oldest supported Ubuntu so the binary runs on glibc 2.35 and newer.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            test: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            test: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            test: true
+          # Cross-compiled on the Apple silicon runner, so its tests cannot run there.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            test: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          name="gocut-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/gocut" LICENSE README.md "dist/$name/"
+          cd dist
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gocut-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # actions/checkout replaces an annotated tag with a lightweight one; fetch the real tag so
+      # --notes-from-tag reads its annotation.
+      - name: Fetch the annotated tag
+        run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: gocut-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          cat ./*.sha256 | sort -k 2 > SHA256SUMS
+          rm ./*.sha256
+          cat SHA256SUMS
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+              --title "$GITHUB_REF_NAME" --notes-from-tag --verify-tag
+          fi

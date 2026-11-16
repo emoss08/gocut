@@ -867,10 +867,20 @@ fn main() -> ExitCode {
         Some("clear-log") => Store::open().and_then(|s| s.clear_log()).map(|()| ExitCode::SUCCESS),
         Some("dumphash") if args.len() == 3 => dumphash(&args[1], &args[2]).map(|()| ExitCode::SUCCESS),
         Some("watch") => watch_cmd(&args[1..]),
+        Some("version" | "--version" | "-V") => {
+            let versions: Vec<String> = pkgbits::SUPPORTED_VERSIONS.iter().map(u32::to_string).collect();
+            println!(
+                "gocut {}\nreads export data versions {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                versions.join(", "),
+                pkgbits::SUPPORTED_GO
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Some(t) if t.contains('/') => toolexec(t, &args[1..]),
         _ => {
             eprintln!(
-                "usage: go build -toolexec=gocut ... | gocut stats [since-seconds] | gocut clear-log | gocut watch ..."
+                "usage: go build -toolexec=gocut ... | gocut stats [since-seconds] | gocut clear-log | gocut watch ... | gocut version"
             );
             Ok(ExitCode::from(2))
         }

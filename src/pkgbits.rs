@@ -47,6 +47,9 @@ const FLAG_SYNC_MARKERS: u32 = 1;
 /// change what a field means without changing its layout, which masking would not notice.
 pub(crate) const SUPPORTED_VERSIONS: &[u32] = &[VERSION_GENERIC_METHODS, VERSION_PRESERVE_METHOD_ORDER];
 
+/// The Go releases that write the versions in `SUPPORTED_VERSIONS`, for `gocut version`.
+pub(crate) const SUPPORTED_GO: &str = "Go 1.27.0 to 1.27.4";
+
 pub(crate) struct PkgBits<'a> {
     pub version: u32,
     pub flags: u32,

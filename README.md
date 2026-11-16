@@ -19,27 +19,53 @@ every verified reuse was byte-identical to the compiler's output. See [Measured 
 It is meant for local hot-reload loops on large Go programs. It is not meant for CI or release
 builds.
 
-**Contents:** [Quick start](#quick-start) · [Why](#why) · [How it decides](#how-it-decides) ·
+**Contents:** [Install](#install) · [Quick start](#quick-start) · [Why](#why) · [How it decides](#how-it-decides) ·
 [Safety model](#safety-model) · [Usage](#usage) · [Hot reload](#hot-reload-gocut-watch) ·
 [Measured so far](#measured-so-far) · [Limits](#limits) · [Disk use](#disk-use) ·
 [Development](#development)
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/emoss08/gocut/main/install.sh | sh
+```
+
+The script downloads the latest [release](https://github.com/emoss08/gocut/releases) for your
+platform, checks it against the release's `SHA256SUMS` and installs `gocut` to `~/.local/bin`.
+`GOCUT_VERSION=v0.2.0` pins a release and `GOCUT_INSTALL_DIR=/usr/local/bin` picks another
+directory. Releases are built for:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 (glibc 2.35 or newer) | `gocut-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.35 or newer) | `gocut-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `gocut-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `gocut-<version>-x86_64-apple-darwin.tar.gz` |
+
+To download by hand, take the archive for your platform and `SHA256SUMS` from the release page,
+check it with `sha256sum --check --ignore-missing SHA256SUMS` (`shasum -a 256 -c` on macOS), and
+put `gocut` from the archive on your `PATH`. `gocut version` prints the installed version and
+the Go releases it supports.
+
+From source, with Rust 1.88 or newer:
+
+```sh
+cargo install --locked --git https://github.com/emoss08/gocut --tag v0.2.0
+```
+
 ## Quick start
 
 ```sh
-# 1. Build gocut (or: cargo install --git https://github.com/emoss08/gocut)
-cargo build --release
+# 1. Build through gocut. The first build is cold; gocut records every package it compiles.
+go build -toolexec="$(command -v gocut)" -o ./bin/app ./cmd/app
 
-# 2. Build through it. The first build is cold; gocut records every package it compiles.
-go build -toolexec="$PWD/target/release/gocut" -o ./bin/app ./cmd/app
-
-# 3. Edit a widely imported package and rebuild. Shadow mode (the default) still compiles
+# 2. Edit a widely imported package and rebuild. Shadow mode (the default) still compiles
 #    everything and checks that gocut's patched output would have been byte-identical.
-go build -toolexec="$PWD/target/release/gocut" -o ./bin/app ./cmd/app
-target/release/gocut stats
+go build -toolexec="$(command -v gocut)" -o ./bin/app ./cmd/app
+gocut stats
 
-# 4. Once shadow mode reports matches on your code, skip the compiler for real.
-GOCUT_MODE=active go build -toolexec="$PWD/target/release/gocut" -o ./bin/app ./cmd/app
+# 3. Once shadow mode reports matches on your code, skip the compiler for real.
+GOCUT_MODE=active go build -toolexec="$(command -v gocut)" -o ./bin/app ./cmd/app
 ```
 
 For a full edit-rebuild-restart loop, see [`gocut watch`](#hot-reload-gocut-watch).
@@ -58,7 +84,7 @@ For a full edit-rebuild-restart loop, see [`gocut watch`](#hot-reload-gocut-watc
   builds correctly: gocut compiles every package normally and reuses nothing. `gocut stats` and
   `$GOCUT_DIR/events.jsonl` show those compiles as blocked with kind `export-data`; on Go 1.26,
   for example: `export data of ex/a: export data version 2 is not one gocut supports ([4, 5])`.
-- Rust 1.88 or newer to build gocut.
+- Rust 1.88 or newer, only to build gocut from source.
 - A Unix-like OS. `gocut watch` needs Linux (inotify and signalfd). Only Linux on amd64 has
   been tested.
 
@@ -294,6 +320,7 @@ gocut's own `GOCUT_*` settings, so changing a gocut setting keeps existing recor
 |---|---|
 | `gocut stats [seconds]` | Summarise the event log, optionally only the last N seconds: decisions, shadow matches and mismatches, compile time a verified reuse would have skipped, top reasons for no reuse, gocut's own overhead, and gocut's time per reused package (median, p90, mean) with a per-phase breakdown from each event's `phases`. |
 | `gocut clear-log` | Delete the event log. |
+| `gocut version` | Print gocut's version and the Go export data versions it reads (also `--version`, `-V`). |
 | `gocut watch ...` | Rebuild and restart a program when a file it is built from changes; see [Hot reload](#hot-reload-gocut-watch). |
 | `gocut gc` | Run eviction now and print the store size before and after. |
 | `gocut dumphash <archive> <pkgpath>` | Debugging: recompute the content hashes of an archive's hashed symbols and report any that differ from the stored ones. |
@@ -443,6 +470,16 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy with warnings a
 unit tests on Linux and macOS, a build and test on the minimum Rust version (1.88), and the toy
 matrix below in shadow and active mode across all three flag modes, on Go 1.27.1 (export data
 version 4) and Go 1.27.4 (version 5).
+
+Pushing an annotated tag `vX.Y.Z` that matches the version in `Cargo.toml` runs the release
+workflow (`.github/workflows/release.yml`): it tests and builds every platform in
+[Install](#install) and publishes a GitHub release with the archives, `SHA256SUMS` and the tag's
+annotation as the release notes.
+
+```sh
+git tag -a v0.2.0 -F notes.md   # after bumping version in Cargo.toml and Cargo.lock
+git push origin v0.2.0
+```
 
 Unit tests cover the export data position masking and hashing, the source scanner, and `gocut
 watch`'s option parsing, `go list` closure and relevance rules, ignore patterns, inotify event
