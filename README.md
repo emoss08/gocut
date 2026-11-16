@@ -477,7 +477,9 @@ workflow (`.github/workflows/release.yml`): it tests and builds every platform i
 annotation as the release notes.
 
 ```sh
-git tag -a v0.2.0 -F notes.md   # after bumping version in Cargo.toml and Cargo.lock
+# After bumping version in Cargo.toml and Cargo.lock. --cleanup=verbatim keeps Markdown
+# headings, which git otherwise strips from a tag message as comments.
+git tag -a v0.2.0 --cleanup=verbatim -F notes.md
 git push origin v0.2.0
 ```
 
