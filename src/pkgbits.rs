@@ -163,6 +163,20 @@ pub(crate) fn decode_elem(raw: &[u8]) -> Result<Elem<'_>> {
     Ok(Elem { relocs, payload: &raw[r.pos..] })
 }
 
+/// Reads an element's reference table into `out`, replacing what it held, and returns where the
+/// payload starts.
+pub(crate) fn read_relocs(raw: &[u8], out: &mut Vec<Reloc>) -> Result<usize> {
+    out.clear();
+    let mut r = Rd::new(raw);
+    let n = usize::try_from(r.uvarint()?)?;
+    for _ in 0..n {
+        let kind = Section::from_u64(r.uvarint()?)?;
+        let idx = u32::try_from(r.uvarint()?).context("reloc index out of range")?;
+        out.push(Reloc { kind, idx });
+    }
+    Ok(r.pos)
+}
+
 pub(crate) fn encode_elem(relocs: &[Reloc], payload: &[u8], out: &mut Vec<u8>) {
     put_uvarint(out, relocs.len() as u64);
     for r in relocs {
@@ -238,7 +252,28 @@ pub(crate) fn put_uvarint(out: &mut Vec<u8>, mut x: u64) {
 }
 
 pub(crate) fn dump(version: u32, flags: u32, ends_ends: &[u32; NUM_SECTIONS], elems: &[Vec<u8>]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+    let mut ends = Vec::with_capacity(elems.len());
+    let mut sum = 0u32;
+    for e in elems {
+        sum = u32::try_from(e.len())
+            .ok()
+            .and_then(|n| sum.checked_add(n))
+            .context("export data element ends overflow u32")?;
+        ends.push(sum);
+    }
+    Ok(dump_flat(version, flags, ends_ends, &ends, &elems.concat()))
+}
+
+/// Writes export data from its elements laid end to end in `data`, with `elem_ends` giving where
+/// each one ends, and appends the fingerprint.
+pub(crate) fn dump_flat(
+    version: u32,
+    flags: u32,
+    ends_ends: &[u32; NUM_SECTIONS],
+    elem_ends: &[u32],
+    data: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 4 * (NUM_SECTIONS + elem_ends.len()) + data.len() + 8);
     out.extend_from_slice(&version.to_le_bytes());
     if version >= VERSION_FLAGS {
         out.extend_from_slice(&flags.to_le_bytes());
@@ -246,20 +281,13 @@ pub(crate) fn dump(version: u32, flags: u32, ends_ends: &[u32; NUM_SECTIONS], el
     for e in ends_ends {
         out.extend_from_slice(&e.to_le_bytes());
     }
-    let mut sum = 0u32;
-    for e in elems {
-        sum = u32::try_from(e.len())
-            .ok()
-            .and_then(|n| sum.checked_add(n))
-            .context("export data element ends overflow u32")?;
-        out.extend_from_slice(&sum.to_le_bytes());
+    for e in elem_ends {
+        out.extend_from_slice(&e.to_le_bytes());
     }
-    for e in elems {
-        out.extend_from_slice(e);
-    }
+    out.extend_from_slice(data);
     let fp = Sha256::digest(&out);
     out.extend_from_slice(&fp[..8]);
-    Ok(out)
+    out
 }
 
 #[cfg(test)]

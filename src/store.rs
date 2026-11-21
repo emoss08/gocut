@@ -96,6 +96,7 @@ pub(crate) struct Event {
     pub gc_ms: f64,
     pub kind: String,
     pub tried: usize,
+    pub relinked: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub phases: BTreeMap<String, f64>,
 }
@@ -166,9 +167,10 @@ fn append(p: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// Eviction ranks record files by when they were last read, and keeps whatever a kept record
+// refers to, so reading one of these files does not need to mark it.
 fn read_zst(p: &Path, what: &str) -> Result<Vec<u8>> {
     let z = std::fs::read(p).with_context(|| format!("saved {what} was evicted"))?;
-    touch(p);
     Ok(zstd::decode_all(z.as_slice())?)
 }
 
@@ -369,9 +371,10 @@ impl Store {
         read_zst(&self.export_path(fp), "export data")
     }
 
-    // <fp>.hash holds appended "name\thash\n" lines; later lines win and an unterminated tail is ignored.
+    // <fp>.objhash holds appended "name\thash\n" lines; later lines win and an unterminated tail is
+    // ignored. (Files named .hash are from before object hashes stopped at a package's path and name.)
     pub(crate) fn read_hashes(&self, fp: &str) -> HashMap<String, String> {
-        let s = std::fs::read_to_string(self.shard("ex", fp, "hash")).unwrap_or_default();
+        let s = std::fs::read_to_string(self.shard("ex", fp, "objhash")).unwrap_or_default();
         let complete = s.rfind('\n').map_or("", |i| &s[..i]);
         complete
             .lines()
@@ -392,25 +395,56 @@ impl Store {
             buf.push_str(h);
             buf.push('\n');
         }
-        let p = self.shard("ex", fp, "hash");
+        let p = self.shard("ex", fp, "objhash");
         std::fs::create_dir_all(p.parent().context("no parent")?)?;
         append(&p, buf.as_bytes())?;
         self.note_written(buf.len());
         Ok(())
     }
 
-    // <fp>.same names the fingerprint whose export data hashes exactly like <fp>'s (positions and
-    // symbol indices aside). Name hashes and package facts are then kept under that fingerprint.
-    pub(crate) fn canonical(&self, fp: &str) -> String {
-        match std::fs::read_to_string(self.shard("ex", fp, "same")) {
+    fn linked(&self, fp: &str, ext: &str) -> String {
+        match std::fs::read_to_string(self.shard("ex", fp, ext)) {
             Ok(c) if c.len() == fp.len() && c.bytes().all(|b| b.is_ascii_hexdigit()) => c,
             _ => fp.to_string(),
         }
     }
 
+    // <fp>.same names the fingerprint whose export data hashes exactly like <fp>'s (positions and
+    // symbol indices aside). Package facts are then kept under that fingerprint.
+    pub(crate) fn canonical(&self, fp: &str) -> String {
+        self.linked(fp, "same")
+    }
+
     pub(crate) fn link_same(&self, fp: &str, canonical: &str) -> Result<()> {
         if fp != canonical {
             self.write_once(&self.shard("ex", fp, "same"), || Ok(canonical.as_bytes().to_vec()))?;
+        }
+        Ok(())
+    }
+
+    // <canonical>.like names the fingerprint whose names hash like <canonical>'s although its import
+    // graph differs. Name hashes are kept under that fingerprint. Takes and returns canonical fingerprints.
+    pub(crate) fn objects_like(&self, canonical: &str) -> String {
+        self.linked(canonical, "like")
+    }
+
+    pub(crate) fn link_like(&self, canonical: &str, like: &str) -> Result<()> {
+        if canonical != like {
+            self.write_once(&self.shard("ex", canonical, "like"), || Ok(like.as_bytes().to_vec()))?;
+        }
+        Ok(())
+    }
+
+    // <fp>.elems names the fingerprint <fp>'s export data was rebuilt from with nothing but its
+    // import graph changed, however many rebuilds ago: outside their strings and packages the two
+    // hold the same elements at the same indices.
+    pub(crate) fn elems_root(&self, fp: &str) -> String {
+        self.linked(fp, "elems")
+    }
+
+    pub(crate) fn link_elems(&self, fp: &str, root: &str) -> Result<()> {
+        if fp != root {
+            self.write_once(&self.shard("ex", fp, "elems"), || Ok(root.as_bytes().to_vec()))?;
         }
         Ok(())
     }
@@ -578,6 +612,7 @@ pub(crate) fn stats(since: Option<&str>) -> Result<()> {
     let (mut check, mut compile, mut n) = (0.0, 0.0, 0usize);
     let mut saved_ms = 0.0;
     let mut older = 0usize;
+    let mut relinked = 0usize;
     let mut reuse_cost: Vec<f64> = Vec::new();
     let mut phase_sum: BTreeMap<String, f64> = BTreeMap::new();
     for line in data.lines() {
@@ -591,6 +626,9 @@ pub(crate) fn stats(since: Option<&str>) -> Result<()> {
         e.1 += ev.compile_ms;
         if ev.decision.starts_with("reuse") && ev.record > 0 {
             older += 1;
+        }
+        if ev.decision.starts_with("reuse") && ev.relinked {
+            relinked += 1;
         }
         if ev.decision.starts_with("reuse") && !ev.decision.contains("failed") {
             reuse_cost.push(ev.total_ms - ev.compile_ms);
@@ -623,6 +661,9 @@ pub(crate) fn stats(since: Option<&str>) -> Result<()> {
     if older > 0 {
         println!("  {:<28} {older:>6}", "reused from an older record");
     }
+    if relinked > 0 {
+        println!("  {:<28} {relinked:>6}", "reused with imports rebuilt");
+    }
     if !shadow.is_empty() {
         println!("shadow verification:");
         for (k, c) in &shadow {
@@ -654,4 +695,82 @@ pub(crate) fn stats(since: Option<&str>) -> Result<()> {
         println!("  mean ms by phase: {}", line.join(", "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A store in a fresh directory under the system temp dir, removed when dropped.
+    struct TempStore(Store);
+
+    impl TempStore {
+        fn new(name: &str) -> TempStore {
+            let dir = std::env::temp_dir().join(format!("gocut-store-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempStore(Store { dir })
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0.dir);
+        }
+    }
+
+    const A: &str = "aaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccc";
+
+    #[test]
+    fn a_position_only_patch_of_rebuilt_export_data_keeps_its_name_hashes() {
+        let t = TempStore::new("links");
+        let st = &t.0;
+        assert_eq!(st.canonical(A), A, "an unlinked fingerprint stands for itself");
+        assert_eq!(st.objects_like(A), A, "an unlinked fingerprint stands for itself");
+        // B is A with its import graph rebuilt; C is B with positions moved.
+        st.link_like(B, &st.objects_like(A)).unwrap();
+        st.link_same(C, &st.canonical(B)).unwrap();
+        assert_eq!(st.canonical(B), B, "a rebuilt import graph is not the same export data");
+        assert_eq!(st.canonical(C), B, "C differs from B in positions only");
+        assert_eq!(st.objects_like(&st.canonical(C)), A, "C's names hash like A's");
+    }
+
+    #[test]
+    fn rebuilds_of_rebuilds_share_one_root() {
+        let t = TempStore::new("elems");
+        let st = &t.0;
+        // B is A with its import graph rebuilt, and C is B with it rebuilt again.
+        st.link_elems(B, &st.elems_root(A)).unwrap();
+        st.link_elems(C, &st.elems_root(B)).unwrap();
+        assert_eq!(st.elems_root(C), A, "C holds A's elements");
+        assert_eq!(st.elems_root(B), st.elems_root(C), "so a record made against B can take C as unchanged");
+        assert_eq!(st.elems_root(A), A, "the root stands for itself");
+    }
+
+    #[test]
+    fn a_malformed_link_is_ignored() {
+        let t = TempStore::new("badlink");
+        let st = &t.0;
+        let p = st.shard("ex", A, "same");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "not a fingerprint").unwrap();
+        assert_eq!(st.canonical(A), A, "the link's contents are not sixteen hex digits");
+    }
+
+    #[test]
+    fn hash_lines_cut_short_are_dropped() {
+        let t = TempStore::new("hashes");
+        let st = &t.0;
+        let h = "0".repeat(64);
+        st.append_hashes(A, &[("Whole".into(), h.clone()), ("Gone".into(), "-".into())]).unwrap();
+        // A writer killed mid-line, then another writer's whole line.
+        append(&st.shard("ex", A, "objhash"), b"Cut\t0000").unwrap();
+        st.append_hashes(A, &[("Later".into(), h.clone())]).unwrap();
+        let got = st.read_hashes(A);
+        assert_eq!(got.get("Whole"), Some(&h), "a whole line is read");
+        assert_eq!(got.get("Gone").map(String::as_str), Some("-"), "a removed name is recorded as such");
+        assert!(!got.contains_key("Cut"), "a cut line never yields a hash");
+    }
 }

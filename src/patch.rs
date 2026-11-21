@@ -9,6 +9,7 @@ use crate::ar;
 use crate::export::{self, Export, Inliner};
 use crate::goobj::{HASH_SIZE, Hasher, Obj, SYMREF_SIZE, SelfPath, SymRef};
 use crate::pkgbits::{self, Section};
+use crate::relink;
 use crate::store::{LsymTable, timed};
 
 #[derive(Debug)]
@@ -27,8 +28,13 @@ pub(crate) struct ChangedDep<'a> {
     /// export data hashes like the old (see `patch_pkgdef` and the full-DWARF guard).
     pub old: Option<&'a Export<'a>>,
     pub new: &'a Export<'a>,
-    pub old_lsyms: &'a LsymTable,
-    pub new_lsyms: &'a LsymTable,
+    /// The dependency's old and new linker symbol tables. None when its export data was only
+    /// rebuilt around a changed import graph: its objects are the old ones, so nothing copied from
+    /// it needs rewriting and no symbol index moved.
+    pub lsyms: Option<(&'a LsymTable, &'a LsymTable)>,
+    /// The dependency's import graph changed, so this package's export data, which repeats that
+    /// graph, is rebuilt (see `relink`).
+    pub imports_changed: bool,
 }
 
 pub(crate) fn lsym_table(ex: &Export<'_>) -> LsymTable {
@@ -53,7 +59,8 @@ fn index_maps<'a>(deps: &[ChangedDep<'a>]) -> Result<IndexMaps<'a>> {
     let mut m = IndexMaps::default();
     let mut old_vals: FxHashMap<(&'a str, &'a str), &'a [i64]> = FxHashMap::default();
     for d in deps {
-        for (path, name, vals) in d.old_lsyms {
+        let Some((old_lsyms, new_lsyms)) = d.lsyms else { continue };
+        for (path, name, vals) in old_lsyms {
             for (s, &v) in vals.iter().enumerate() {
                 if v < 0 {
                     continue;
@@ -65,7 +72,7 @@ fn index_maps<'a>(deps: &[ChangedDep<'a>]) -> Result<IndexMaps<'a>> {
             }
             old_vals.insert((path.as_str(), name.as_str()), vals.as_slice());
         }
-        for (path, name, vals) in d.new_lsyms {
+        for (path, name, vals) in new_lsyms {
             m.new_vals.insert((path.as_str(), name.as_str()), vals.as_slice());
         }
     }
@@ -94,6 +101,9 @@ impl Walk<'_, '_> {
                 continue;
             }
             if k == Section::Pkg {
+                // Import lists may differ (`relink` rewrites them); the package referred to may not.
+                let (pp, po, pn) = (pkg_path(self.p, ip)?, pkg_path(self.o, io)?, pkg_path(self.n, inn)?);
+                ensure!(pp == po && po == pn, "a copied object refers to a different package");
                 continue;
             }
             if k == Section::String {
@@ -138,15 +148,33 @@ impl Walk<'_, '_> {
     }
 }
 
+fn pkg_path<'x>(ex: &'x Export<'_>, idx: u32) -> Result<&'x [u8]> {
+    let path = ex.pkg_elem(idx)?.path;
+    Ok(if path.is_empty() { ex.self_path.as_bytes() } else { path })
+}
+
+/// How a patched package's new export data relates to its old.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Link {
+    /// Every name hashes the same and so does the import graph: only positions and symbol indices moved.
+    Same,
+    /// Every name hashes the same, but the import graph differs.
+    Objects,
+}
+
 struct PkgdefPatch {
     bytes: Option<Vec<u8>>,
     old_fp: [u8; 8],
     new_fp: [u8; 8],
-    equivalent: bool,
+    link: Option<Link>,
+    relinked: bool,
+    // The import graph was rebuilt and no other element changed.
+    same_elements: bool,
 }
 
-// The rewritten export data hashes like the old one if every replaced element masks to the same bytes
-// when parsed in its new context. Relocs, strings, names and Meta are never replaced.
+// The rewritten export data's names hash like the old one's if every replaced element masks to the
+// same bytes when parsed in its new context. Strings, names and Meta are never replaced, and a
+// rebuilt import graph leaves every element outside the String and Pkg sections at its index.
 fn masks_equal(old: &Export<'_>, new_bits: &[u8], self_path: &str, inliner: Inliner, abs: &[usize]) -> bool {
     let Ok(new) = Export::parse(new_bits, self_path, inliner) else { return false };
     abs.iter().all(|&a| {
@@ -170,6 +198,9 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep<'_>]) -> R
         }
         let mut src = None;
         for (di, d) in changed.iter().enumerate() {
+            if d.lsyms.is_none() {
+                continue;
+            }
             match d.old {
                 Some(o) => {
                     if let Some(io) = o.find(&id.path, &id.name) {
@@ -199,23 +230,45 @@ fn patch_pkgdef(pkgdef: &[u8], self_path: &str, changed: &[ChangedDep<'_>]) -> R
         )?;
     }
     crate::store::add_phase("p_walk", tw.elapsed().as_secs_f64() * 1000.0);
-    if replaced.is_empty() {
-        return Ok(PkgdefPatch { bytes: None, old_fp, new_fp: old_fp, equivalent: true });
+    let relinked = changed.iter().any(|d| d.imports_changed);
+    if replaced.is_empty() && !relinked {
+        return Ok(PkgdefPatch {
+            bytes: None,
+            old_fp,
+            new_fp: old_fp,
+            link: Some(Link::Same),
+            relinked,
+            same_elements: false,
+        });
     }
+    let same_elements = replaced.is_empty();
     let mut abs: Vec<usize> = replaced.keys().copied().collect();
     abs.sort_unstable();
-    let elems: Vec<Vec<u8>> =
-        (0..ex.pb.elem_ends.len()).map(|a| replaced.remove(&a).unwrap_or_else(|| ex.pb.raw_abs(a).to_vec())).collect();
-    let nb = pkgbits::dump(ex.pb.version, ex.pb.flags, &ex.pb.ends_ends, &elems)?;
+    let (nb, names_kept) = if relinked {
+        let deps: Vec<&Export<'_>> = changed.iter().filter(|d| d.imports_changed).map(|d| d.new).collect();
+        let r = timed("p_relink", || relink::relink(&ex, &deps, &replaced))?;
+        (r.bits, r.names_kept)
+    } else {
+        let elems: Vec<Vec<u8>> = (0..ex.pb.elem_ends.len())
+            .map(|a| replaced.remove(&a).unwrap_or_else(|| ex.pb.raw_abs(a).to_vec()))
+            .collect();
+        (pkgbits::dump(ex.pb.version, ex.pb.flags, &ex.pb.ends_ends, &elems)?, true)
+    };
     let mut new_fp = [0u8; 8];
     new_fp.copy_from_slice(&nb[nb.len() - 8..]);
-    let equivalent = timed("p_equiv", || masks_equal(&ex, &nb, self_path, loc.inliner, &abs));
+    let masked_same = timed("p_equiv", || masks_equal(&ex, &nb, self_path, loc.inliner, &abs));
+    let link = match (masked_same, relinked) {
+        (true, false) => Some(Link::Same),
+        (true, true) if names_kept => Some(Link::Objects),
+        _ => None,
+    };
     let tail = &pkgdef[loc.bits_end..];
     let mut out = Vec::with_capacity(loc.bits_start + nb.len() + tail.len());
     out.extend_from_slice(&pkgdef[..loc.bits_start]);
     out.extend_from_slice(&nb);
     out.extend_from_slice(tail);
-    Ok(PkgdefPatch { bytes: Some(out), old_fp, new_fp, equivalent })
+    let same_elements = same_elements && link == Some(Link::Objects);
+    Ok(PkgdefPatch { bytes: Some(out), old_fp, new_fp, link, relinked, same_elements })
 }
 
 fn moved_types<'n>(d: &ChangedDep<'_>, want: &HashSet<&'n str>) -> Result<HashSet<&'n str>> {
@@ -429,11 +482,23 @@ fn rewrite_build_id(members: &mut [ar::Member], old_buildid: &str, new_buildid: 
     Ok(())
 }
 
+/// A patched package's old and new export data fingerprints, and how the two relate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Equivalent {
+    pub link: Link,
+    pub old: [u8; 8],
+    pub new: [u8; 8],
+    /// Only the import graph was rebuilt: every other element is the old one, at its old index.
+    pub same_elements: bool,
+}
+
 pub(crate) struct Patched {
     pub bytes: Vec<u8>,
     pub remapped_refs: usize,
-    /// Old and new export data fingerprints, when the new export data hashes exactly like the old.
-    pub equivalent: Option<([u8; 8], [u8; 8])>,
+    /// Set when the export data changed and its names still hash like the old one's.
+    pub equivalent: Option<Equivalent>,
+    /// Whether the export data's import graph was rebuilt.
+    pub relinked: bool,
 }
 
 pub(crate) struct Target<'a> {
@@ -453,7 +518,13 @@ pub(crate) fn patch(t: &Target<'_>, changed: &[ChangedDep<'_>], new_fps: &HashMa
     let oi = members.iter().position(|m| m.name == "_go_.o").context("no _go_.o")?;
 
     let pkgdef = timed("p_pkgdef", || patch_pkgdef(&members[pi].data, self_path, changed))?;
-    let equivalent = (pkgdef.equivalent && pkgdef.old_fp != pkgdef.new_fp).then_some((pkgdef.old_fp, pkgdef.new_fp));
+    let equivalent = pkgdef.link.filter(|_| pkgdef.old_fp != pkgdef.new_fp).map(|link| Equivalent {
+        link,
+        old: pkgdef.old_fp,
+        new: pkgdef.new_fp,
+        same_elements: pkgdef.same_elements,
+    });
+    let relinked = pkgdef.relinked;
     if let Some(bytes) = pkgdef.bytes {
         members[pi].data = bytes;
     }
@@ -491,5 +562,5 @@ pub(crate) fn patch(t: &Target<'_>, changed: &[ChangedDep<'_>], new_fps: &HashMa
     members[oi].data = b;
 
     rewrite_build_id(&mut members, old_buildid, new_buildid)?;
-    Ok(Patched { bytes: timed("p_ar", || ar::write(&members)), remapped_refs: remaps.len(), equivalent })
+    Ok(Patched { bytes: timed("p_ar", || ar::write(&members)), remapped_refs: remaps.len(), equivalent, relinked })
 }

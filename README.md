@@ -105,10 +105,10 @@ the compiler for them.
 For each `compile` invocation, gocut:
 
 1. Computes a compile key from the package's source files (by content), embedded files, the
-   compiler flags, every `GO*` environment variable, and the compiler binary's path, size and
-   modification time. Output paths and `-c=N` are left out of the key.
+   compiler flags, the import map, every `GO*` environment variable, and the compiler binary's
+   path, size and modification time. Output paths and `-c=N` are left out of the key.
 2. Looks up the records saved under that key: up to `GOCUT_RECORDS` (default 4), one per set of
-   dependency fingerprints, most recent first. No record means the package's own inputs changed,
+   dependency fingerprints, and tries the one with the fewest changed dependencies first. No record means the package's own inputs changed,
    so the compiler runs. Keeping several records lets an undo, which cmd/go serves from its own
    cache without running the compiler, still find a matching earlier state.
 3. For each record in turn, compares each dependency's export data fingerprint with the one in
@@ -117,13 +117,15 @@ For each `compile` invocation, gocut:
    scanning the package's source for selectors on the import's local name) and compares a hash
    of each name in the old and new export data. The hash covers the object and everything it
    reaches in the unified IR (types, signatures, inline bodies, nested objects). It ignores line
-   and column positions and linker symbol indices. A name that was removed counts as changed.
+   and column positions, linker symbol indices, and the import lists of the packages it reaches
+   (see [Import changes](#import-changes)). A name that was removed counts as changed.
 5. If every used name hashes the same, it reuses the old archive and patches it.
 
 A changed dependency whose new export data gocut itself produced, by a patch that only moved
 positions or symbol indices in copied objects, skips step 4 and the identity and import-graph checks: gocut
 links the new fingerprint to the old one (`.same`), so every name hashes the same by
-construction. This matters because a patched package's export data changes whenever it carries
+construction. Export data gocut rebuilt around a changed import graph gets a weaker link
+(`.like`): its names hash the same, so step 4 is skipped, but its import graph is still compared. This matters because a patched package's export data changes whenever it carries
 copies of moved objects, and without the link each of its importers would re-hash every name it
 uses. The link is written only after the new export data is re-parsed and every replaced element
 masks to the same bytes, and only when the output used is the patched archive.
@@ -136,17 +138,45 @@ Patching rewrites:
   moved;
 - the content hashes of content-addressed symbols whose bytes changed;
 - copies of dependency objects carried in the package's own export data, including their moved
-  positions. Any other difference in a copied object stops the reuse.
+  positions. Any other difference in a copied object stops the reuse;
+- the copy of the import graph in the package's export data, when a dependency's imports
+  changed.
+
+### Import changes
+
+Export data lists, for every package it mentions, that package's imports, and so on down: each
+package carries its whole transitive import graph. Adding or removing one import therefore
+changes the export data of every package above it. The compiler only copies those lists from
+one package's export data into the next; nothing it generates depends on them.
+
+So an import change in a dependency does not block reuse. gocut rebuilds the package's export
+data with the new lists, which it reads from the changed dependencies' own export data,
+numbering strings and packages in the order the compiler's export writer would have reached
+them, and patches the rest as usual. Before it trusts the rebuild, it runs the same code with
+the old lists and requires the layout the old export data has: the same strings and package
+elements, byte for byte, and every other element reached in order. If that fails, the package
+is compiled normally (`patch-failed`, with the reason). `gocut stats` counts these reuses as
+`reused with imports rebuilt`.
+
+This matters more than the other edits gocut handles. When only a dependency's API or line
+numbers change, the go command's own cache stops the rebuild at the first package whose export
+data comes out the same. An import change comes out the same nowhere, so without gocut it
+recompiles every package above the edited one: 2,079 packages on Trenova's API server, against
+1,076 for an appended function in the same package.
+
+One element is kept as the old export data has it: the one for `builtin`, the pseudo-package
+that `error` and the other predeclared names belong to. Its encoding depends on which import
+first supplied an object that mentions it, and no reader interprets the difference.
 
 ### Guards
 
 Reuse is blocked when:
 
 - a changed dependency gained or lost an `init`, or changed its package name;
-- a changed dependency's import graph changed;
 - a changed dependency's export data is a version gocut does not read (see
   [Requirements](#requirements));
 - the package dot-imports a changed dependency;
+- a changed dependency is one the go command added, which the sources do not import by name;
 - the package uses cgo or other generated sources, assembly (`-asmhdr`, `-symabis`),
   `-linkobj`, PGO or coverage instrumentation;
 - the package calls methods of a dependency type whose declaration lines moved, because the
@@ -324,6 +354,7 @@ gocut's own `GOCUT_*` settings, so changing a gocut setting keeps existing recor
 | `gocut watch ...` | Rebuild and restart a program when a file it is built from changes; see [Hot reload](#hot-reload-gocut-watch). |
 | `gocut gc` | Run eviction now and print the store size before and after. |
 | `gocut dumphash <archive> <pkgpath>` | Debugging: recompute the content hashes of an archive's hashed symbols and report any that differ from the stored ones. |
+| `gocut relinkcheck <archive> <pkgpath>` | Debugging: check that gocut can rebuild an archive's export data byte for byte, which [import changes](#import-changes) rely on. |
 
 ## Measured so far
 
@@ -423,6 +454,9 @@ median of about 170 to 240 ms per reused package.
   name, which only reduces reuse.
 - The first build with `-toolexec` is cold, and so is the first build after changing any `GO*`
   environment variable.
+- A dependency that gains its first `init` (its first package-level initializer, or its first
+  import of a package that has one) blocks its importers, and each importer that had no `init`
+  gains one in turn.
 
 ## Disk use
 
@@ -432,7 +466,7 @@ The store lives in `GOCUT_DIR`:
 |---|---|
 | `rec/` | One JSON file per compile key, holding up to `GOCUT_RECORDS` records. |
 | `out/` | Compiled archives, zstd-compressed, by content hash. |
-| `ex/` | Per dependency fingerprint: its export data (`.bits.zst`), cached name hashes (`.hash`, one `name<TAB>hash` line per entry, appended), its linker symbol table (`.lsym`), its package name, init flag and import-graph hash (`.pkg`), and, for export data gocut produced by a position-only patch, the fingerprint it hashes like (`.same`; hashes and package facts are then kept under that fingerprint). |
+| `ex/` | Per dependency fingerprint: its export data (`.bits.zst`), cached name hashes (`.objhash`, one `name<TAB>hash` line per entry, appended), its linker symbol table (`.lsym`), its package name, init flag and import-graph hash (`.pkg`), and, for export data gocut produced itself, the fingerprint it hashes like: `.same` after a position-only patch (hashes and package facts are then kept under that fingerprint), `.like` after an import graph was rebuilt (only hashes are), and `.elems` when rebuilding the import graph was all that changed (importers then need nothing from the old export data). |
 | `mismatch/` | Saved mismatch pairs. |
 | `gc.total`, `gc.added` | Size of the store at the last eviction walk, and bytes written since. |
 | `events.jsonl` | Event log, one line per compile. |
@@ -483,15 +517,17 @@ git tag -a v0.2.0 --cleanup=verbatim -F notes.md
 git push origin v0.2.0
 ```
 
-Unit tests cover the export data position masking and hashing, the source scanner, and `gocut
+Unit tests cover the export data position masking and hashing, rebuilding export data around
+a changed import graph, the store's links and hash cache, the source scanner, and `gocut
 watch`'s option parsing, `go list` closure and relevance rules, ignore patterns, inotify event
 parsing, content dedupe, and process-group shutdown.
 
 ### Toy matrix
 
-`scripts/toy-matrix.sh` builds a small module (`ex/a`, `ex/b`, `ex/p`, `ex/q`, `ex/cmd`) in a
-temporary directory. For each scenario it builds once through gocut, makes one edit to `ex/a`,
-rebuilds through gocut, builds the same tree without gocut, and checks:
+`scripts/toy-matrix.sh` builds a small module in a temporary directory: `ex/a` with its importers
+`ex/b`, `ex/p` and `ex/q`, the chain `ex/d`, `ex/e`, `ex/g` for import changes, and `ex/cmd`.
+For each scenario it builds once through gocut, makes one edit to `ex/a` (or, in the `import-*`
+scenarios, to `ex/d`), rebuilds through gocut, builds the same tree without gocut, and checks:
 
 - each first-party package's decision against an expectation (reuse, blocked with a given
   reason, not recompiled);
@@ -524,14 +560,17 @@ Scenarios:
 
 - `s4-end`: an exported function appended to a file in the shipment domain package;
 - `s4-mid`: the same function inserted right after the imports, shifting every later line;
-- `s2-body`: a line added inside an unexported function in `shipment.go`.
+- `s2-body`: a line added inside an unexported function in `shipment.go`;
+- `s5-import`: a new file in the shipment domain package that imports a standard package the
+  package did not import, so every package above it sees a changed import graph.
 
 Each scenario does a warm build, then the edit and a timed build, then a revert and a timed
 build. In shadow and active mode it prints `gocut stats` after each scenario. It refuses to edit
 a file with uncommitted changes and restores every edited file on exit.
 
 It uses separate Go caches for baseline (`~/.cache/go-build-gocut-base`) and gocut runs
-(`~/.cache/go-build-gocut`), and `~/.cache/gocut-tms` as the gocut store. It stops if those
+(`~/.cache/go-build-gocut`), and `~/.cache/gocut-tms` as the gocut store; `CACHE_DIR` puts all
+three somewhere other than `~/.cache`. It stops if those
 caches pass `LIMIT_GB` (default 18) and sets `GOCUT_MAX_BYTES` to 3 GiB unless you set it.
 `NODWARF=1` adds `-dwarf=false` to the compiler flags, matching Trenova's watch builds (the link
 already strips DWARF with `-w`).

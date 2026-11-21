@@ -413,6 +413,7 @@ impl<'a> Export<'a> {
             let body = pr.reloc(Section::Body)?;
             by_base.entry(path).or_default().entry(body_base(&name).to_string()).or_default().push(body);
         }
+        ensure!(pr.rd.at_end(), "trailing bytes in the private root");
         let mut bodies = FxHashMap::default();
         if !by_base.is_empty() {
             for (i, id) in idents.iter().enumerate() {
@@ -696,6 +697,7 @@ impl<'a> Export<'a> {
         &self,
         k: Section,
         idx: u32,
+        edges: PkgEdges,
         h: &mut blake3::Hasher,
         ord: &mut FxHashMap<(Section, u32), u32>,
     ) -> Result<Option<Rc<Node>>> {
@@ -720,11 +722,15 @@ impl<'a> Export<'a> {
         };
         h.update(&u32::try_from(payload.len())?.to_le_bytes());
         h.update(payload);
+        if k == Section::Pkg && edges == PkgEdges::Skip {
+            h.update(&0u32.to_le_bytes());
+            return Ok(None);
+        }
         h.update(&u32::try_from(node.children.len())?.to_le_bytes());
         Ok(Some(node))
     }
 
-    fn closure_hash(&self, k0: Section, i0: u32) -> Result<[u8; 32]> {
+    fn closure_hash(&self, k0: Section, i0: u32, edges: PkgEdges) -> Result<[u8; 32]> {
         struct Frame {
             node: Rc<Node>,
             next: usize,
@@ -732,7 +738,7 @@ impl<'a> Export<'a> {
         let mut h = blake3::Hasher::new();
         let mut ord: FxHashMap<(Section, u32), u32> = FxHashMap::default();
         let mut stack: Vec<Frame> = Vec::new();
-        if let Some(node) = self.enter(k0, i0, &mut h, &mut ord)? {
+        if let Some(node) = self.enter(k0, i0, edges, &mut h, &mut ord)? {
             stack.push(Frame { node, next: 0 });
         }
         while let Some(top) = stack.last_mut() {
@@ -743,19 +749,57 @@ impl<'a> Export<'a> {
             let (tagb, k, idx) = top.node.children[top.next];
             top.next += 1;
             h.update(&[tagb]);
-            if let Some(node) = self.enter(k, idx, &mut h, &mut ord)? {
+            if let Some(node) = self.enter(k, idx, edges, &mut h, &mut ord)? {
                 stack.push(Frame { node, next: 0 });
             }
         }
         Ok(*h.finalize().as_bytes())
     }
 
+    /// Hashes an object and everything it reaches. A package it reaches counts by path and name
+    /// only: the compiler copies a package's import list into export data and reads it nowhere
+    /// else, and `relink` rebuilds those lists when they change.
     pub(crate) fn obj_hash(&self, root: u32) -> Result<[u8; 32]> {
-        self.closure_hash(Section::Obj, root)
+        self.closure_hash(Section::Obj, root, PkgEdges::Skip)
     }
 
+    /// Hashes the package's import graph: every package it reaches, with each one's imports in order.
     pub(crate) fn pkg_hash(&self) -> Result<[u8; 32]> {
-        self.closure_hash(Section::Pkg, self.self_pkg)
+        self.closure_hash(Section::Pkg, self.self_pkg, PkgEdges::Follow)
+    }
+
+    pub(crate) fn self_pkg(&self) -> u32 {
+        self.self_pkg
+    }
+
+    /// The object indices whose inline bodies the private root lists, with those bodies.
+    pub(crate) fn bodies_of(&self, obj: u32) -> &[u32] {
+        self.bodies.get(&obj).map_or(&[], Vec::as_slice)
+    }
+
+    /// The path Pkg element `idx` is written with: empty when it names the package itself
+    /// without spelling its path.
+    pub(crate) fn pkg_path(&self, idx: u32) -> Result<&'a [u8]> {
+        ER::new(&self.pb, Section::Pkg, idx)?.string()
+    }
+
+    /// Decodes Pkg element `idx`. The path is empty when the element names the package itself
+    /// without spelling its path.
+    pub(crate) fn pkg_elem(&self, idx: u32) -> Result<PkgElem<'a>> {
+        let mut r = ER::new(&self.pb, Section::Pkg, idx)?;
+        let path = r.string()?;
+        if path == b"builtin" || path == b"unsafe" {
+            ensure!(r.rd.at_end(), "trailing bytes in Pkg element {idx}");
+            return Ok(PkgElem { path, name: None, imports: Vec::new() });
+        }
+        let name = r.string()?;
+        let n = usize::try_from(r.rd.uvarint()?)?;
+        let mut imports = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            imports.push(r.reloc(Section::Pkg)?);
+        }
+        ensure!(r.rd.at_end(), "trailing bytes in Pkg element {idx}");
+        Ok(PkgElem { path, name: Some(name), imports })
     }
 
     pub(crate) fn inliner(&self) -> Inliner {
@@ -765,6 +809,21 @@ impl<'a> Export<'a> {
     pub(crate) fn find(&self, path: &str, name: &str) -> Option<u32> {
         self.by_ident.get(path)?.get(name).copied()
     }
+}
+
+/// A decoded Pkg element: `name` is None for the two packages written by path alone (builtin and
+/// unsafe), and `imports` are Pkg indices in the order the package's own compile listed them.
+pub(crate) struct PkgElem<'a> {
+    pub path: &'a [u8],
+    pub name: Option<&'a [u8]>,
+    pub imports: Vec<u32>,
+}
+
+// Whether a closure hash follows a package's imports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PkgEdges {
+    Follow,
+    Skip,
 }
 
 // Which inliner wrote the export data. The new one (GOEXPERIMENT=newinliner, named in the header's

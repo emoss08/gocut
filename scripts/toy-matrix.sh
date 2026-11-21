@@ -65,6 +65,11 @@ SCENARIOS=(
 	reexport-unrelated
 	iface-method-body
 	embedded-unrelated-field
+	import-add-newfile
+	import-add-shift
+	import-add-firstparty
+	import-remove-file
+	import-add-used
 )
 
 declare -A DESC=(
@@ -86,6 +91,11 @@ declare -A DESC=(
 	[reexport-unrelated]="append an unrelated func; b re-exports a.T in its API (b.Get() a.T)"
 	[iface-method-body]="change the body of Counter.Inc, which q calls through an interface q defines"
 	[embedded-unrelated-field]="add a field to T (b and p use it); q embeds a.Base in its own struct"
+	[import-add-newfile]="d imports strings in a new file; e, g and main only repeat d's import graph"
+	[import-add-shift]="d imports strings in d.go, shifting every later line; g calls a method of d.DT"
+	[import-add-firstparty]="d imports ex/n, a package nothing imported before"
+	[import-remove-file]="delete d/sorted.go, the only file of d that imports sort"
+	[import-add-used]="d imports strings and DVal, which e and g call, changes with it"
 )
 
 replace_once() {
@@ -109,7 +119,7 @@ append_a() {
 
 write_tree() {
 	local src=$1
-	mkdir -p -- "$src/a" "$src/b" "$src/p" "$src/q" "$src/cmd"
+	mkdir -p -- "$src/a" "$src/b" "$src/p" "$src/q" "$src/cmd" "$src/d" "$src/e" "$src/g" "$src/n"
 	printf 'module ex\n\ngo %s\n' "$go_line" >"$src/go.mod"
 
 	cat >"$src/a/a.go" <<'EOF'
@@ -242,10 +252,74 @@ func Run() int {
 }
 EOF
 
+	# d -> e -> g -> main: the chain the import-* scenarios edit the bottom of. n is imported by
+	# nothing until a scenario adds it.
+	cat >"$src/d/d.go" <<'EOF'
+package d
+
+import "errors"
+
+var ErrD = errors.New("d")
+
+type DT struct{ N int }
+
+func (t DT) Twice() int { return t.N * 2 }
+
+func DVal() int { return 5 }
+EOF
+
+	cat >"$src/d/sorted.go" <<'EOF'
+package d
+
+import "sort"
+
+func Sorted(xs []int) []int {
+	sort.Ints(xs)
+	return xs
+}
+EOF
+
+	cat >"$src/n/n.go" <<'EOF'
+package n
+
+import "errors"
+
+var ErrN = errors.New("n")
+
+func NVal() int { return 9 }
+EOF
+
+	cat >"$src/e/e.go" <<'EOF'
+package e
+
+import "ex/d"
+
+func EGet() d.DT { return d.DT{N: 3} }
+
+func ESum() int { return d.DVal() + 1 }
+EOF
+
+	cat >"$src/g/g.go" <<'EOF'
+package g
+
+import (
+	"ex/d"
+	"ex/e"
+)
+
+func Run() int {
+	if d.ErrD == nil {
+		return 0
+	}
+	return e.ESum() + d.DVal() + e.EGet().Twice()
+}
+EOF
+
 	cat >"$src/cmd/main.go" <<'EOF'
 package main
 
 import (
+	"ex/g"
 	"ex/p"
 	"ex/q"
 )
@@ -253,6 +327,7 @@ import (
 func main() {
 	println("p.Run", p.Run())
 	println("q.Run", q.Run())
+	println("g.Run", g.Run())
 }
 EOF
 }
@@ -342,8 +417,58 @@ edit_embedded_unrelated_field() {
 	replace_once "$1/a/a.go" $'Y int\n}' $'Y int; Z int\n}'
 }
 
+write_upper() {
+	cat >"$1/d/upper.go" <<'EOF'
+package d
+
+import "strings"
+
+func Upper(s string) string { return strings.ToUpper(s) }
+EOF
+}
+
+edit_import_add_newfile() {
+	write_upper "$1"
+}
+
+edit_import_add_shift() {
+	replace_once "$1/d/d.go" 'import "errors"' $'import (\n\t"errors"\n\t"strings"\n)' || return 1
+	printf '\n%s\n' 'func Upper(s string) string { return strings.ToUpper(s) }' >>"$1/d/d.go"
+}
+
+edit_import_add_firstparty() {
+	cat >"$1/d/fromn.go" <<'EOF'
+package d
+
+import "ex/n"
+
+func FromN() int { return n.NVal() }
+EOF
+}
+
+edit_import_remove_file() {
+	rm -- "$1/d/sorted.go"
+}
+
+edit_import_add_used() {
+	write_upper "$1" || return 1
+	replace_once "$1/d/d.go" 'func DVal() int { return 5 }' 'func DVal() int { return len(Upper("abcdef")) }'
+}
+
 want() {
 	printf '%s %s\n' "$1" "$2"
+}
+
+# The import-* scenarios edit ex/d, not ex/a: a, b, p and q are not recompiled.
+want_d_chain() {
+	want ex/a skip
+	want ex/b skip
+	want ex/p skip
+	want ex/q skip
+	want ex/d no-record
+	want ex/e "$1"
+	want ex/g "$2"
+	want main "$3"
 }
 
 want3() {
@@ -426,6 +551,36 @@ exp_embedded_unrelated_field() {
 	want ex/b 'blocked~ex/a.T'
 	want ex/p blocked
 	want ex/q reuse
+}
+
+exp_import_add_newfile() { want_d_chain reuse reuse reuse; }
+
+# Every line of d.go moves. Without -l, the bodies e and g inline carry those lines, and main
+# inlines g.Run. With -l and full DWARF, g is still recompiled: it calls DT.Twice, whose
+# declaration moved.
+exp_import_add_shift() {
+	case $1 in
+	default) want_d_chain 'blocked~ex/d.DT' 'blocked~ex/d.DVal' 'blocked~ex/g.Run' ;;
+	nl) want_d_chain reuse 'blocked~declaration lines moved' reuse ;;
+	*) want_d_chain reuse reuse reuse ;;
+	esac
+}
+
+exp_import_add_firstparty() {
+	want_d_chain reuse reuse reuse
+	want ex/n no-record
+}
+
+exp_import_remove_file() { want_d_chain reuse reuse reuse; }
+
+# Without -l, DVal's body is in d's export data, e and g inline it, and main inlines g.Run.
+# With -l only its signature is, which did not change.
+exp_import_add_used() {
+	if [[ $1 == default ]]; then
+		want_d_chain 'blocked~ex/d.DVal' 'blocked~ex/d.DVal' 'blocked~ex/g.Run'
+	else
+		want_d_chain reuse reuse reuse
+	fi
 }
 
 parse_events() {

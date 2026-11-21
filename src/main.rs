@@ -6,6 +6,7 @@ mod goobj;
 mod ignore;
 mod patch;
 mod pkgbits;
+mod relink;
 mod store;
 mod usage;
 #[cfg(target_os = "linux")]
@@ -145,7 +146,7 @@ fn parse_args(args: &[String]) -> Result<CompileArgs> {
 #[derive(Default)]
 struct ImportCfg {
     files: BTreeMap<String, PathBuf>,
-    importmap: HashMap<String, String>,
+    importmap: BTreeMap<String, String>,
 }
 
 fn read_importcfg(p: &Path) -> Result<ImportCfg> {
@@ -161,21 +162,40 @@ fn read_importcfg(p: &Path) -> Result<ImportCfg> {
     Ok(cfg)
 }
 
-fn compile_key(st: &Store, tool: &str, ca: &CompileArgs) -> Result<String> {
-    let mut buf = b"gocut-key-1\0".to_vec();
+// The GO* variables the compiler may read, sorted so the key does not depend on the order the
+// environment lists them in. Compared as bytes: a value need not be UTF-8.
+fn go_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env: Vec<_> = std::env::vars_os()
+        .filter(|(k, _)| {
+            let k = k.as_encoded_bytes();
+            k.starts_with(b"GO") && !k.starts_with(b"GOCUT_") && k != b"GOFLAGS"
+        })
+        .collect();
+    env.sort();
+    env
+}
+
+fn compile_key(st: &Store, tool: &str, ca: &CompileArgs, cfg: &ImportCfg) -> Result<String> {
+    let mut buf = b"gocut-key-2\0".to_vec();
     let md = std::fs::metadata(tool)?;
     buf.extend_from_slice(tool.as_bytes());
     buf.extend_from_slice(&md.len().to_le_bytes());
     if let Some(d) = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
         buf.extend_from_slice(&d.as_nanos().to_le_bytes());
     }
-    for (k, v) in std::env::vars() {
-        if k.starts_with("GO") && !k.starts_with("GOCUT_") && k != "GOFLAGS" {
-            buf.extend_from_slice(k.as_bytes());
-            buf.push(b'=');
-            buf.extend_from_slice(v.as_bytes());
-            buf.push(0);
-        }
+    for (k, v) in go_env() {
+        buf.extend_from_slice(k.as_encoded_bytes());
+        buf.push(b'=');
+        buf.extend_from_slice(v.as_encoded_bytes());
+        buf.push(0);
+    }
+    // Which package each import path names decides what the sources mean, and the usage roots
+    // saved with a record are computed through this map.
+    for (from, to) in &cfg.importmap {
+        buf.extend_from_slice(from.as_bytes());
+        buf.push(b'=');
+        buf.extend_from_slice(to.as_bytes());
+        buf.push(0);
     }
     for a in &ca.norm {
         buf.extend_from_slice(a.as_bytes());
@@ -260,11 +280,11 @@ struct Prep {
 }
 
 fn prepare(st: &Store, tool: &str, ca: &CompileArgs) -> Result<Prep> {
-    let key = timed("key", || compile_key(st, tool, ca))?;
     let cfg = match &ca.importcfg {
         Some(p) => read_importcfg(p)?,
         None => ImportCfg::default(),
     };
+    let key = timed("key", || compile_key(st, tool, ca, &cfg))?;
     let mut deps = BTreeMap::new();
     timed("dep_fps", || -> Result<()> {
         for (k, p) in &cfg.files {
@@ -297,7 +317,6 @@ enum BlockKind {
     ExportData,
     DotImport,
     PkgIdentity,
-    ImportGraph,
     UsesChanged,
     Guard,
     Evicted,
@@ -312,7 +331,6 @@ impl BlockKind {
             BlockKind::ExportData => "export-data",
             BlockKind::DotImport => "dot-import",
             BlockKind::PkgIdentity => "pkg-identity",
-            BlockKind::ImportGraph => "import-graph",
             BlockKind::UsesChanged => "uses-changed",
             BlockKind::Guard => "guard",
             BlockKind::Evicted => "evicted",
@@ -327,7 +345,7 @@ enum Decision {
     Unsupported(Unsupported),
     PrepareFailed(String),
     Blocked { kind: BlockKind, reason: String },
-    Reuse { patched: Vec<u8>, remapped: usize, changed: usize, equivalent: Option<([u8; 8], [u8; 8])> },
+    Reuse { patched: Vec<u8>, remapped: usize, changed: usize, equivalent: Option<patch::Equivalent>, relinked: bool },
 }
 
 impl Decision {
@@ -352,7 +370,7 @@ fn changed_deps(rec: &Record, fps: &BTreeMap<String, String>) -> Option<Vec<Stri
     Some(fps.iter().filter(|&(k, v)| &rec.deps[k] != v).map(|(k, _)| k.clone()).collect())
 }
 
-fn pkg_facts(st: &Store, fp: &str, ex: &Export<'_>) -> Result<(String, bool, String)> {
+fn pkg_facts(st: &Store, fp: &str, ex: &Export<'_>) -> Result<Facts> {
     if let Some(f) = st.read_pkg_facts(fp) {
         return Ok(f);
     }
@@ -363,15 +381,15 @@ fn pkg_facts(st: &Store, fp: &str, ex: &Export<'_>) -> Result<(String, bool, Str
     Ok(f)
 }
 
-struct HashCache<'a> {
-    fp: &'a str,
+struct HashCache {
+    fp: String,
     cur: HashMap<String, String>,
     add: Vec<(String, String)>,
 }
 
-impl<'a> HashCache<'a> {
-    fn open(st: &Store, fp: &'a str) -> HashCache<'a> {
-        HashCache { fp, cur: st.read_hashes(fp), add: Vec::new() }
+impl HashCache {
+    fn open(st: &Store, fp: String) -> HashCache {
+        HashCache { cur: st.read_hashes(&fp), fp, add: Vec::new() }
     }
 
     fn get(&mut self, ex: &Export<'_>, path: &str, name: &str) -> Result<String> {
@@ -388,7 +406,7 @@ impl<'a> HashCache<'a> {
     }
 
     fn flush(self, st: &Store) {
-        let _ = st.append_hashes(self.fp, &self.add);
+        let _ = st.append_hashes(&self.fp, &self.add);
     }
 }
 
@@ -420,8 +438,37 @@ struct Dep<'x> {
     ofp: &'x str,
     nfp: &'x str,
     new: Export<'x>,
+    // Old and new fingerprints after following .same: equal when only positions and symbol indices moved.
     canon: (String, String),
+    // The fingerprints the old and new name hashes are kept under: equal when every name hashes
+    // the same, whether or not the import graph changed.
+    like: (String, String),
+    // The old export data's package facts, when the store has them.
+    old_facts: Option<Facts>,
+    // gocut rebuilt the new export data from the old (in one step or several) with nothing but the
+    // import graph changed.
+    same_elements: bool,
     need_old: bool,
+}
+
+// A package's name, whether it has an init task, and the hash of its import graph.
+type Facts = (String, bool, String);
+
+impl Dep<'_> {
+    fn names_same(&self) -> bool {
+        self.like.0 == self.like.1
+    }
+}
+
+// A changed dependency that passed decide's checks, as the patch takes it.
+struct Pair<'x> {
+    ofp: &'x str,
+    nfp: &'x str,
+    old: Option<Export<'x>>,
+    new: &'x Export<'x>,
+    imports_changed: bool,
+    // The dependency's objects and symbol indices are as they were; only its import graph changed.
+    objects_unchanged: bool,
 }
 
 // A changed dependency gocut cannot reason about at all: export data it does not read, or a dot
@@ -438,6 +485,81 @@ fn refuse_changed(rec: &Record, prep: &Prep, changed: &[String]) -> Option<Decis
         .map(|p| Decision::blocked(BlockKind::DotImport, format!("dot import of {p}")))
 }
 
+// Parses each changed dependency's new export data and reads the store's links for it.
+fn load_deps<'x>(st: &Store, rec: &'x Record, prep: &'x Prep, changed: &'x [String]) -> Result<Vec<Dep<'x>>> {
+    let mut ds = Vec::with_capacity(changed.len());
+    for p in changed {
+        let (d, ofp, nfp) = (&prep.deps[p], rec.deps[p].as_str(), prep.fps[p].as_str());
+        let ni = timed("read_new_export", || d.inliner())?;
+        let new = timed("parse_dep", || Export::parse(d.bits()?, p, ni))?;
+        let _ = timed("write_export", || st.write_export(nfp, d.bits()?));
+        let canon = (st.canonical(ofp), st.canonical(nfp));
+        let (like, old_facts, same_elements) = if canon.0 == canon.1 {
+            (canon.clone(), None, false)
+        } else {
+            let like = (st.objects_like(&canon.0), st.objects_like(&canon.1));
+            (like, st.read_pkg_facts(&canon.0), st.elems_root(ofp) == st.elems_root(nfp))
+        };
+        ds.push(Dep { p, ofp, nfp, new, canon, like, old_facts, same_elements, need_old: true });
+    }
+    Ok(ds)
+}
+
+// Checks one changed dependency: Ok(Err) is a decision not to reuse.
+fn check_dep<'x>(
+    st: &Store,
+    rec: &Record,
+    d: &'x Dep<'x>,
+    old: Option<Export<'x>>,
+) -> Result<std::result::Result<Pair<'x>, Decision>> {
+    let p = d.p;
+    let (oc, nc) = &d.canon;
+    if oc == nc {
+        // gocut produced the new export data from the old by moving positions only; it hashes the same.
+        let pair = Pair { ofp: d.ofp, nfp: d.nfp, old, new: &d.new, imports_changed: false, objects_unchanged: false };
+        return Ok(Ok(pair));
+    }
+    let of = match (&d.old_facts, &old) {
+        (Some(f), _) => f.clone(),
+        (None, Some(old)) => pkg_facts(st, oc, old)?,
+        (None, None) => anyhow::bail!("old export data of {p} not loaded"),
+    };
+    let nf = pkg_facts(st, nc, &d.new)?;
+    if of.0 != nf.0 || of.1 != nf.1 {
+        return Ok(Err(Decision::blocked(BlockKind::PkgIdentity, format!("{p}: package name or init changed"))));
+    }
+    // A changed import graph does not change what this package compiles to, only the copy of
+    // the graph in its export data, which the patch rebuilds.
+    let imports_changed = of.2 != nf.2;
+    let Some(names) = rec.roots.names.get(p) else {
+        // Every import the sources name has an entry, so this dependency is one the go command
+        // added. Nothing says what the package takes from it.
+        let reason = format!("{p} changed and is not imported by name");
+        return Ok(Err(Decision::blocked(BlockKind::UsesChanged, reason)));
+    };
+    // Export data gocut rebuilt around a changed import graph hashes like the one it came from.
+    if !d.names_same() {
+        let old = old.as_ref().context("old export data not loaded")?;
+        let t = Instant::now();
+        let (mut oh, mut nh) = (HashCache::open(st, d.like.0.clone()), HashCache::open(st, d.like.1.clone()));
+        let mut differs = None;
+        for n in names {
+            if oh.get(old, p, n)? != nh.get(&d.new, p, n)? {
+                differs = Some(n);
+                break;
+            }
+        }
+        oh.flush(st);
+        nh.flush(st);
+        store::add_phase("uses", ms(t));
+        if let Some(n) = differs {
+            return Ok(Err(Decision::blocked(BlockKind::UsesChanged, format!("uses changed {p}.{n}"))));
+        }
+    }
+    let objects_unchanged = d.same_elements && old.is_none();
+    Ok(Ok(Pair { ofp: d.ofp, nfp: d.nfp, old, new: &d.new, imports_changed, objects_unchanged }))
+}
+
 fn decide(
     st: &Store,
     ca: &CompileArgs,
@@ -449,23 +571,23 @@ fn decide(
     if let Some(d) = refuse_changed(rec, prep, changed) {
         return Ok(d);
     }
-    let mut ds = Vec::with_capacity(changed.len());
-    for p in changed {
-        let (d, ofp, nfp) = (&prep.deps[p], rec.deps[p].as_str(), prep.fps[p].as_str());
-        let ni = timed("read_new_export", || d.inliner())?;
-        let new = timed("parse_dep", || Export::parse(d.bits()?, p, ni))?;
-        let _ = timed("write_export", || st.write_export(nfp, d.bits()?));
-        let canon = (st.canonical(ofp), st.canonical(nfp));
-        ds.push(Dep { p, ofp, nfp, new, canon, need_old: true });
-    }
+    let mut ds = load_deps(st, rec, prep, changed)?;
     let mut old_out = None;
-    // A dependency whose new export data hashes like its old needs the old export data only to
-    // walk objects this package copies from it, or to rebuild a missing symbol table.
-    if !ca.full_dwarf && ds.iter().any(|d| d.canon.0 == d.canon.1) {
-        let out = old_out.insert(timed("read_blob", || st.read_blob(&rec.out))?);
-        let copied = timed("copied", || copied_idents(out, &ca.pkg))?;
-        for d in ds.iter_mut().filter(|d| d.canon.0 == d.canon.1) {
-            d.need_old = !st.has_lsyms(d.ofp) || copied.iter().any(|(path, name)| d.new.find(path, name).is_some());
+    // A dependency whose names hash like its old ones needs the old export data only to work out
+    // package facts the store does not have and, unless its objects are the old ones outright, to
+    // walk objects this package copies from it or to rebuild a missing symbol table.
+    if !ca.full_dwarf && ds.iter().any(Dep::names_same) {
+        let copied = if ds.iter().any(|d| d.names_same() && !d.same_elements) {
+            let out = old_out.insert(timed("read_blob", || st.read_blob(&rec.out))?);
+            timed("copied", || copied_idents(out, &ca.pkg))?
+        } else {
+            Vec::new()
+        };
+        for d in ds.iter_mut().filter(|d| d.names_same()) {
+            let facts_missing = d.canon.0 != d.canon.1 && d.old_facts.is_none();
+            let objects_needed = !d.same_elements
+                && (!st.has_lsyms(d.ofp) || copied.iter().any(|(path, name)| d.new.find(path, name).is_some()));
+            d.need_old = facts_missing || objects_needed;
         }
     }
     for d in ds.iter().filter(|d| d.need_old) {
@@ -479,55 +601,36 @@ fn decide(
     let olds = &*olds;
     let mut pairs = Vec::with_capacity(ds.len());
     for d in &ds {
-        let p = d.p;
         let old = if d.need_old {
-            Some(timed("parse_dep", || Export::parse(&olds[d.ofp], p, d.new.inliner()))?)
+            Some(timed("parse_dep", || Export::parse(&olds[d.ofp], d.p, d.new.inliner()))?)
         } else {
             None
         };
-        let (oc, nc) = &d.canon;
-        if oc == nc {
-            // gocut produced the new export data from the old by moving positions only; it hashes the same.
-            pairs.push((d.ofp, d.nfp, old, &d.new));
-            continue;
+        match check_dep(st, rec, d, old)? {
+            Ok(pair) => pairs.push(pair),
+            Err(decision) => return Ok(decision),
         }
-        let old = old.context("old export data not loaded")?;
-        let (of, nf) = (pkg_facts(st, oc, &old)?, pkg_facts(st, nc, &d.new)?);
-        if of.0 != nf.0 || of.1 != nf.1 {
-            return Ok(Decision::blocked(BlockKind::PkgIdentity, format!("{p}: package name or init changed")));
-        }
-        if of.2 != nf.2 {
-            return Ok(Decision::blocked(BlockKind::ImportGraph, format!("{p}: import graph changed")));
-        }
-        if let Some(names) = rec.roots.names.get(p) {
-            let t = Instant::now();
-            let (mut oh, mut nh) = (HashCache::open(st, oc), HashCache::open(st, nc));
-            let mut differs = None;
-            for n in names {
-                if oh.get(&old, p, n)? != nh.get(&d.new, p, n)? {
-                    differs = Some(n);
-                    break;
-                }
-            }
-            oh.flush(st);
-            nh.flush(st);
-            store::add_phase("uses", ms(t));
-            if let Some(n) = differs {
-                return Ok(Decision::blocked(BlockKind::UsesChanged, format!("uses changed {p}.{n}")));
-            }
-        }
-        pairs.push((d.ofp, d.nfp, Some(old), &d.new));
     }
-    let lsyms: Vec<(LsymTable, LsymTable)> = timed("lsyms", || {
+    let lsyms: Vec<Option<(LsymTable, LsymTable)>> = timed("lsyms", || {
         pairs
             .iter()
-            .map(|(ofp, nfp, old, new)| Ok((lsyms_for(st, ofp, old.as_ref())?, lsyms_for(st, nfp, Some(new))?)))
+            .map(|p| {
+                if p.objects_unchanged {
+                    return Ok(None);
+                }
+                Ok(Some((lsyms_for(st, p.ofp, p.old.as_ref())?, lsyms_for(st, p.nfp, Some(p.new))?)))
+            })
             .collect::<Result<_>>()
     })?;
     let deps: Vec<patch::ChangedDep<'_>> = pairs
         .iter()
         .zip(&lsyms)
-        .map(|((_, _, old, new), (ol, nl))| patch::ChangedDep { old: old.as_ref(), new, old_lsyms: ol, new_lsyms: nl })
+        .map(|(p, l)| patch::ChangedDep {
+            old: p.old.as_ref(),
+            new: p.new,
+            lsyms: l.as_ref().map(|(ol, nl)| (ol, nl)),
+            imports_changed: p.imports_changed,
+        })
         .collect();
     let new_fps: HashMap<String, [u8; 8]> = prep.deps.iter().map(|(k, d)| (k.clone(), d.fp)).collect();
     let old_out = match old_out {
@@ -542,7 +645,13 @@ fn decide(
         full_dwarf: ca.full_dwarf,
     };
     let p = timed("patch", || patch::patch(&target, &deps, &new_fps))?;
-    Ok(Decision::Reuse { patched: p.bytes, remapped: p.remapped_refs, changed: deps.len(), equivalent: p.equivalent })
+    Ok(Decision::Reuse {
+        patched: p.bytes,
+        remapped: p.remapped_refs,
+        changed: deps.len(),
+        equivalent: p.equivalent,
+        relinked: p.relinked,
+    })
 }
 
 fn is_evicted(e: &anyhow::Error) -> bool {
@@ -571,28 +680,40 @@ fn try_decide(
     }
 }
 
-fn choose(st: &Store, ca: &CompileArgs, recs: &[Record], prep: &Prep) -> (Decision, usize) {
+// The records' indices with each one's changed dependencies (None when its import set differs),
+// fewest changes first and the more recent record first among equals.
+fn closest_first(recs: &[Record], fps: &BTreeMap<String, String>) -> Vec<(usize, Option<Vec<String>>)> {
+    let mut order: Vec<(usize, Option<Vec<String>>)> =
+        recs.iter().enumerate().map(|(i, rec)| (i, changed_deps(rec, fps))).collect();
+    order.sort_by_key(|(i, changed)| (changed.as_ref().map_or(usize::MAX, Vec::len), *i));
+    order
+}
+
+// Tries the saved records, the one with the fewest changed dependencies first: it is the cheapest
+// to patch and the least likely to be blocked. The most recent record is often not that one: after
+// an edit is undone, which the go command serves from its cache without compiling, the newest
+// record is still the edited state. Returns the decision, how many records were tried, and which
+// record allowed reuse. When none did, the reason is the one from the closest record.
+fn choose(st: &Store, ca: &CompileArgs, recs: &[Record], prep: &Prep) -> (Decision, usize, Option<usize>) {
     let n = recs.len().min(store::max_records());
     let mut olds = HashMap::new();
-    let mut best: Option<(usize, BlockKind, String)> = None;
-    for (i, rec) in recs[..n].iter().enumerate() {
-        let (changed, d) = match changed_deps(rec, &prep.fps) {
-            None => (usize::MAX, Decision::blocked(BlockKind::ImportSet, "import set changed")),
-            Some(c) => (c.len(), try_decide(st, ca, rec, prep, &c, &mut olds)),
+    let mut closest: Option<(BlockKind, String)> = None;
+    for (tried, (i, changed)) in closest_first(&recs[..n], &prep.fps).into_iter().enumerate() {
+        let d = match changed {
+            None => Decision::blocked(BlockKind::ImportSet, "import set changed"),
+            Some(c) => try_decide(st, ca, &recs[i], prep, &c, &mut olds),
         };
         match d {
             Decision::Blocked { kind, reason } => {
-                if best.as_ref().is_none_or(|b| changed < b.0) {
-                    best = Some((changed, kind, reason));
-                }
+                closest.get_or_insert((kind, reason));
             }
-            d => return (d, i + 1),
+            d => return (d, tried + 1, Some(i)),
         }
     }
-    match best {
-        None => (Decision::NoRecord, 0),
-        Some((_, kind, r)) => {
-            (Decision::blocked(kind, format!("{r} (tried {n} record{})", if n == 1 { "" } else { "s" })), n)
+    match closest {
+        None => (Decision::NoRecord, 0, None),
+        Some((kind, r)) => {
+            (Decision::blocked(kind, format!("{r} (tried {n} record{})", if n == 1 { "" } else { "s" })), n, None)
         }
     }
 }
@@ -608,16 +729,33 @@ fn exec_tool(tool: &str, args: &[String]) -> anyhow::Error {
     anyhow::anyhow!("exec {tool}: {err}")
 }
 
+// A dependency's export data the store does not hold yet.
+struct NewExport {
+    path: String,
+    fp: String,
+    bits: Vec<u8>,
+    inliner: Inliner,
+}
+
 struct Pending {
     key: String,
     rec: Record,
     recs: Vec<Record>,
-    exports: Vec<(String, Vec<u8>)>,
+    exports: Vec<NewExport>,
 }
 
 // Reads every input the record needs now, while the sources and dependency archives are as compiled.
-fn pending_record(st: &Store, ca: &CompileArgs, prep: &Prep, recs: Vec<Record>) -> Result<Pending> {
-    let roots = match recs.first() {
+// `reused` is the record that allowed reuse, if one did. Its roots still hold: the sources and the
+// import map are the same (they are in the key), and every dependency that changed since kept its
+// package name. After any other decision the names may have changed, so the sources are scanned again.
+fn pending_record(
+    st: &Store,
+    ca: &CompileArgs,
+    prep: &Prep,
+    recs: Vec<Record>,
+    reused: Option<usize>,
+) -> Result<Pending> {
+    let roots = match reused.and_then(|i| recs.get(i)) {
         Some(r) => r.roots.clone(),
         None => compute_roots(ca, prep)?,
     };
@@ -625,7 +763,12 @@ fn pending_record(st: &Store, ca: &CompileArgs, prep: &Prep, recs: Vec<Record>) 
     for (k, d) in &prep.deps {
         let fp = &prep.fps[k];
         if !st.has_export(fp) {
-            exports.push((fp.clone(), d.bits()?.to_vec()));
+            exports.push(NewExport {
+                path: k.clone(),
+                fp: fp.clone(),
+                bits: d.bits()?.to_vec(),
+                inliner: d.inliner()?,
+            });
         }
     }
     let rec =
@@ -634,9 +777,19 @@ fn pending_record(st: &Store, ca: &CompileArgs, prep: &Prep, recs: Vec<Record>) 
 }
 
 fn save_record(st: &Store, mut p: Pending, out: &[u8]) -> Result<()> {
-    timed("rec_exports", || p.exports.iter().try_for_each(|(fp, bits)| st.write_export(fp, bits)))?;
+    timed("rec_exports", || p.exports.iter().try_for_each(|e| st.write_export(&e.fp, &e.bits)))?;
     p.rec.out = timed("rec_blob", || st.write_blob(out))?;
-    timed("rec_json", || st.write_record(&p.key, &p.rec, &p.recs))
+    timed("rec_json", || st.write_record(&p.key, &p.rec, &p.recs))?;
+    // With the record saved, work out what the next build would otherwise work out while the go
+    // command waits: each new dependency's package facts and symbol table. Export data gocut
+    // does not read has neither.
+    for e in &p.exports {
+        if let Ok(ex) = Export::parse(&e.bits, &e.path, e.inliner) {
+            let _ = pkg_facts(st, &st.canonical(&e.fp), &ex);
+            let _ = lsyms_for(st, &e.fp, Some(&ex));
+        }
+    }
+    Ok(())
 }
 
 // Saving the record only matters to later builds, so it runs in a detached child and the compile
@@ -688,13 +841,13 @@ fn toolexec(tool: &str, args: &[String]) -> Result<ExitCode> {
         None => prepare(&st, tool, &ca).map_err(|e| Decision::PrepareFailed(format!("prepare failed: {e:#}"))),
     };
     ev.prep_ms = ms(t0);
-    let (prep, recs, decision, tried) = match prep {
+    let (prep, recs, decision, tried, used) = match prep {
         Ok(p) => {
             let recs = st.read_records(&p.key);
-            let (d, tried) = choose(&st, &ca, &recs, &p);
-            (Some(p), recs, d, tried)
+            let (d, tried, used) = choose(&st, &ca, &recs, &p);
+            (Some(p), recs, d, tried, used)
         }
-        Err(d) => (None, Vec::new(), d, 0),
+        Err(d) => (None, Vec::new(), d, 0, None),
     };
     ev.check_ms = ms(t0);
     ev.decide_ms = ev.check_ms - ev.prep_ms;
@@ -702,6 +855,7 @@ fn toolexec(tool: &str, args: &[String]) -> Result<ExitCode> {
     ev.decision = decision.name().to_string();
     ev.tried = tried;
     let mut equivalent = None;
+    let mut reused = None;
     let patched = match decision {
         Decision::NoRecord => None,
         Decision::Unsupported(u) => {
@@ -719,65 +873,97 @@ fn toolexec(tool: &str, args: &[String]) -> Result<ExitCode> {
             ev.reason = reason;
             None
         }
-        Decision::Reuse { patched, remapped, changed, equivalent: eq } => {
-            ev.record = tried - 1;
+        Decision::Reuse { patched, remapped, changed, equivalent: eq, relinked } => {
+            ev.record = used.unwrap_or(0);
+            reused = used;
             ev.remapped = remapped;
             ev.changed_deps = changed;
+            ev.relinked = relinked;
             equivalent = eq;
             Some(patched)
         }
     };
     let patched_len = patched.as_ref().map(Vec::len);
 
-    let output = match patched {
-        Some(p) if m == Mode::Active && !sampled(&ca) => {
-            timed("write_out", || std::fs::write(&ca.out, &p))?;
-            p
-        }
-        patched => {
-            if m == Mode::Active && patched.is_some() {
-                ev.decision = "reuse+verify".into();
+    // In active mode a reuse outside the verified sample is written straight to the output. If
+    // that fails the compiler runs after all: it reports the problem in its own words, or succeeds.
+    let mut patched = patched;
+    let mut written = None;
+    if m == Mode::Active
+        && !sampled(&ca)
+        && let Some(p) = patched.take()
+    {
+        match timed("write_out", || std::fs::write(&ca.out, &p)) {
+            Ok(()) => written = Some(p),
+            Err(e) => {
+                ev.decision = "blocked".into();
+                ev.kind = "write-failed".into();
+                ev.reason = format!("writing the reused archive: {e}");
             }
-            let t1 = Instant::now();
-            let status = Command::new(tool).args(args).status()?;
-            ev.compile_ms = ms(t1);
-            ev.compiled = true;
-            if !status.success() {
-                ev.decision = format!("{}+compile-failed", ev.decision);
+        }
+    }
+    let output = if let Some(p) = written {
+        p
+    } else {
+        if m == Mode::Active && patched.is_some() {
+            ev.decision = "reuse+verify".into();
+        }
+        let t1 = Instant::now();
+        let status = Command::new(tool).args(args).status()?;
+        ev.compile_ms = ms(t1);
+        ev.compiled = true;
+        if !status.success() {
+            ev.decision = format!("{}+compile-failed", ev.decision);
+            ev.phases = store::take_phases();
+            st.log(&ev);
+            // A Unix exit code is 0 to 255; a signal death has none and counts as 1.
+            let code = status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(1);
+            return Ok(ExitCode::from(code));
+        }
+        // The build has its output; without a copy of it there is only no record to save.
+        let real = match std::fs::read(&ca.out) {
+            Ok(real) => real,
+            Err(e) => {
+                ev.reason = format!("{} reading the compiler's output: {e}", ev.reason);
+                ev.total_ms = ms(t0);
                 ev.phases = store::take_phases();
                 st.log(&ev);
-                // A Unix exit code is 0 to 255; a signal death has none and counts as 1.
-                let code = status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(1);
-                return Ok(ExitCode::from(code));
+                return Ok(ExitCode::SUCCESS);
             }
-            let real = std::fs::read(&ca.out)?;
-            if let Some(p) = &patched {
-                if *p == real {
-                    ev.shadow = "match".into();
-                } else {
-                    let n = p.len().max(real.len());
-                    let diff = (0..n).filter(|&i| p.get(i) != real.get(i)).count();
-                    ev.shadow = format!("mismatch:{diff}");
-                    st.save_mismatch(&ca.pkg, p, &real);
-                    if m == Mode::Active {
-                        eprintln!(
-                            "gocut: verification mismatch for {} ({diff} bytes); used the real compile. Report this.",
-                            ca.pkg
-                        );
-                    }
+        };
+        if let Some(p) = &patched {
+            if *p == real {
+                ev.shadow = "match".into();
+            } else {
+                let n = p.len().max(real.len());
+                let diff = (0..n).filter(|&i| p.get(i) != real.get(i)).count();
+                ev.shadow = format!("mismatch:{diff}");
+                st.save_mismatch(&ca.pkg, p, &real);
+                if m == Mode::Active {
+                    eprintln!(
+                        "gocut: verification mismatch for {} ({diff} bytes); used the real compile. Report this.",
+                        ca.pkg
+                    );
                 }
             }
-            real
         }
+        real
     };
 
     // The output is the patched archive (active reuse, or a verified match): its export data hashes like the old.
-    if let Some((o, n)) = equivalent
+    if let Some(eq) = equivalent
         && (ev.shadow == "match" || (!ev.compiled && patched_len == Some(output.len())))
     {
-        let _ = st.link_same(&hex8(n), &st.canonical(&hex8(o)));
+        let (old, new) = (st.canonical(&hex8(eq.old)), hex8(eq.new));
+        let _ = match eq.link {
+            patch::Link::Same => st.link_same(&new, &old),
+            patch::Link::Objects => st.link_like(&st.canonical(&new), &st.objects_like(&old)),
+        };
+        if eq.same_elements {
+            let _ = st.link_elems(&new, &st.elems_root(&hex8(eq.old)));
+        }
     }
-    let pending = prep.as_ref().map(|p| timed("rec_read", || pending_record(&st, &ca, p, recs)));
+    let pending = prep.as_ref().map(|p| timed("rec_read", || pending_record(&st, &ca, p, recs, reused)));
     ev.total_ms = ms(t0);
     ev.phases = store::take_phases();
     let pending = match pending {
@@ -836,6 +1022,23 @@ fn dumphash(archive: &str, pkg: &str) -> Result<()> {
     Ok(())
 }
 
+// Debugging: whether gocut can rebuild an archive's export data layout exactly (see relink.rs).
+fn relinkcheck(archive: &str, pkg: &str) -> Result<()> {
+    let pkgdef = ar::read_pkgdef(Path::new(archive))?;
+    let loc = export::locate(&pkgdef)?;
+    let bits = &pkgdef[loc.bits_start..loc.bits_end];
+    let t = Instant::now();
+    let ex = Export::parse(bits, pkg, loc.inliner)?;
+    let parsed = ms(t);
+    relink::reproduce(&ex, bits)?;
+    println!(
+        "{pkg}: layout reproduced ({} bytes of export data; parsed in {parsed:.1} ms, rebuilt in {:.1} ms)",
+        bits.len(),
+        ms(t) - parsed
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn watch_cmd(args: &[String]) -> Result<ExitCode> {
     watch::run(watch::parse_options(args)?)
@@ -866,6 +1069,7 @@ fn main() -> ExitCode {
         }),
         Some("clear-log") => Store::open().and_then(|s| s.clear_log()).map(|()| ExitCode::SUCCESS),
         Some("dumphash") if args.len() == 3 => dumphash(&args[1], &args[2]).map(|()| ExitCode::SUCCESS),
+        Some("relinkcheck") if args.len() == 3 => relinkcheck(&args[1], &args[2]).map(|()| ExitCode::SUCCESS),
         Some("watch") => watch_cmd(&args[1..]),
         Some("version" | "--version" | "-V") => {
             let versions: Vec<String> = pkgbits::SUPPORTED_VERSIONS.iter().map(u32::to_string).collect();
@@ -880,7 +1084,7 @@ fn main() -> ExitCode {
         Some(t) if t.contains('/') => toolexec(t, &args[1..]),
         _ => {
             eprintln!(
-                "usage: go build -toolexec=gocut ... | gocut stats [since-seconds] | gocut clear-log | gocut watch ... | gocut version"
+                "usage: go build -toolexec=gocut ... | gocut stats [since-seconds] | gocut gc | gocut clear-log | gocut watch ... | gocut version"
             );
             Ok(ExitCode::from(2))
         }
@@ -891,5 +1095,52 @@ fn main() -> ExitCode {
             eprintln!("gocut: {e:#}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(deps: &[(&str, &str)]) -> Record {
+        Record {
+            pkg: "ex/p".into(),
+            buildid: String::new(),
+            out: String::new(),
+            deps: deps.iter().map(|&(k, v)| (k.to_string(), v.to_string())).collect(),
+            roots: Roots::default(),
+        }
+    }
+
+    // After an edit is undone the newest record is the edited state; the next edit should start
+    // from the record nearest to what is being built, not from the newest.
+    #[test]
+    fn the_record_with_the_fewest_changed_dependencies_is_tried_first() {
+        let now: BTreeMap<String, String> =
+            [("ex/a", "a2"), ("ex/b", "b1"), ("ex/c", "c1")].iter().map(|&(k, v)| (k.into(), v.into())).collect();
+        let recs = [
+            rec(&[("ex/a", "a9"), ("ex/b", "b9"), ("ex/c", "c9")]),
+            rec(&[("ex/a", "a1"), ("ex/b", "b1"), ("ex/c", "c1")]),
+            rec(&[("ex/a", "a1"), ("ex/b", "b1")]),
+            rec(&[("ex/a", "a1"), ("ex/b", "b1"), ("ex/c", "c1")]),
+        ];
+        let order = closest_first(&recs, &now);
+        let indices: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, [1, 3, 0, 2], "one change (newer first), then three, then another import set");
+        assert_eq!(order[0].1.as_deref(), Some(&["ex/a".to_string()][..]), "only ex/a differs from record 1");
+        assert_eq!(order[3].1, None, "record 2 imports a different set of packages");
+    }
+
+    #[test]
+    fn the_key_environment_is_sorted_and_leaves_out_gocut_settings() {
+        let env = go_env();
+        assert!(env.is_sorted(), "the key must not depend on the order of the environment");
+        assert!(
+            env.iter().all(|(k, _)| {
+                let k = k.as_encoded_bytes();
+                k.starts_with(b"GO") && !k.starts_with(b"GOCUT_") && k != b"GOFLAGS"
+            }),
+            "only GO* variables that are not gocut's own or GOFLAGS"
+        );
     }
 }
